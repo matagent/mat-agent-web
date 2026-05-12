@@ -30,6 +30,12 @@ from agent.langchain_mcp_agent import create_agent as create_mcp_agent
 # 数据库配置
 DB_PATH = "matagent_server_history.db"
 
+
+def _normalize_elements(elements_str: str) -> list[str]:
+    """规范化元素符号: 首字母大写，第二个字母小写"""
+    return [e.strip().capitalize() for e in elements_str.split(",") if e.strip()]
+
+
 # ============ 数据库操作函数 ============
 
 def _ensure_chat_table():
@@ -741,12 +747,12 @@ async def search_materials(
         # 构建参数
         params: dict[str, Any] = {"chunk_size": chunk_size}
         if elements:
-            params["elements"] = [e.strip() for e in elements.split(",")]
+            params["elements"] = _normalize_elements(elements)
         if exclude_elements:
-            params["exclude_elements"] = [e.strip() for e in exclude_elements.split(",")]
+            params["exclude_elements"] = _normalize_elements(exclude_elements)
         if formula:
             params["formula"] = formula.strip()
-        
+
         # 直接调用 MCP 工具获取结构化数据
         result = await invoke_mcp_tool_direct("search_materials_from_mp", params)
         return {"result": result}
@@ -779,7 +785,7 @@ async def search_materials_oqmd(
     try:
         params: dict[str, Any] = {"stability_max": stability_max, "limit": limit}
         if elements:
-            params["elements"] = [e.strip() for e in elements.split(",")]
+            params["elements"] = _normalize_elements(elements)
         if band_gap_min is not None:
             params["band_gap_min"] = band_gap_min
         if band_gap_max is not None:
