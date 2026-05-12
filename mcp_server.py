@@ -801,18 +801,22 @@ async def search_materials_from_oqmd(
     band_gap_min: Optional[float] = None,
     band_gap_max: Optional[float] = None,
     stability_max: float = 0.1,
-    limit: int = 20
+    limit: int = 20,
+    num_elements_min: Optional[int] = None,
+    num_elements_max: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     在OQMD数据库搜索材料
-    
+
     Args:
         elements: 元素列表，如 ["Li", "Fe", "O"] 或 ["Si"]
         band_gap_min: 最小带隙值（eV），如 0.0
         band_gap_max: 最大带隙值（eV），如 3.0
         stability_max: 最大稳定性值（eV/atom），默认 0.1
         limit: 返回结果数量限制，默认 20
-    
+        num_elements_min: 最小元素种类数
+        num_elements_max: 最大元素种类数
+
     Returns:
         Dict: OQMD搜索结果
     """
@@ -827,21 +831,30 @@ async def search_materials_from_oqmd(
         args["stability_max"] = stability_max
     if limit != 20:
         args["limit"] = limit
-    
+    if num_elements_min is not None:
+        args["num_elements_min"] = num_elements_min
+    if num_elements_max is not None:
+        args["num_elements_max"] = num_elements_max
+
     filter_parts = []
-    
+
     if elements:
         element_set = ",".join(elements)
         filter_parts.append(f"element_set={element_set}")
-    
+
     if band_gap_min is not None:
         filter_parts.append(f"band_gap>={band_gap_min}")
-    
+
     if band_gap_max is not None:
         filter_parts.append(f"band_gap<={band_gap_max}")
-    
+
     if stability_max is not None:
         filter_parts.append(f"stability<={stability_max}")
+
+    if num_elements_min is not None:
+        filter_parts.append(f"ntypes>={num_elements_min}")
+    if num_elements_max is not None:
+        filter_parts.append(f"ntypes<={num_elements_max}")
     
     filter_expr = " AND ".join(filter_parts) if filter_parts else None
     
@@ -943,7 +956,8 @@ async def search_materials_from_mp(
     num_elements: tuple[int, int] | None = None,
     formula: str | list[str] | None = None,
     chunk_size: int | None = 25,
-    energy_above_hull: tuple[float, float] | None = None
+    energy_above_hull_min: float | None = None,
+    energy_above_hull_max: float | None = None
 ) -> dict:
     """
     Material Project数据查询工具
@@ -956,7 +970,8 @@ async def search_materials_from_mp(
         num_elements: 元素数量范围，如 (2, 4)
         formula: 化学式，如 "LiFeO2" 或 ["LiFeO2", "NaCl"]
         chunk_size: 每块返回数量，默认25
-        energy_above_hull: 形成能范围 (eV/atom)，如 (0.0, 0.1) 只返回稳定/近稳态材料。默认 None 不限制
+        energy_above_hull_min: 最小形成能 (eV/atom)，默认不限制
+        energy_above_hull_max: 最大形成能 (eV/atom)，默认不限制
 
     Returns:
         list[dict]: 材料列表（按 energy_above_hull 升序，最稳定的排在前面）
@@ -976,8 +991,10 @@ async def search_materials_from_mp(
         args["formula"] = formula
     if chunk_size is not None and chunk_size != 25:
         args["chunk_size"] = chunk_size
-    if energy_above_hull is not None:
-        args["energy_above_hull"] = energy_above_hull
+    if energy_above_hull_min is not None:
+        args["energy_above_hull_min"] = energy_above_hull_min
+    if energy_above_hull_max is not None:
+        args["energy_above_hull_max"] = energy_above_hull_max
     
     API_KEY = MY_API_KEY
     if not API_KEY:
@@ -1003,11 +1020,11 @@ async def search_materials_from_mp(
             chunk_sz = chunk_size if chunk_size else 25
 
             results = mpr.materials.summary.search(**search_kwargs, chunk_size=chunk_sz, num_chunks=1)
-            # 在 Python 端按 energy_above_hull 过滤和排序（MP API 不支持此过滤参数）
-            if energy_above_hull:
-                lo, hi = energy_above_hull
+            # 在 Python 端按 energy_above_hull 过滤和排序
+            if energy_above_hull_min is not None and energy_above_hull_max is not None:
                 results = [r for r in results
-                           if r.energy_above_hull is not None and lo <= r.energy_above_hull <= hi]
+                           if r.energy_above_hull is not None
+                           and energy_above_hull_min <= r.energy_above_hull <= energy_above_hull_max]
             # 按稳定性排序: energy_above_hull 越小越稳定
             results = sorted(results, key=lambda r: r.energy_above_hull or 999)
             print(f"查询到 {len(results)} 个材料")

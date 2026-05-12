@@ -740,11 +740,16 @@ async def search_materials(
     elements: str | None = None,
     exclude_elements: str | None = None,
     formula: str | None = None,
+    band_gap_min: float | None = None,
+    band_gap_max: float | None = None,
+    energy_above_hull_min: float | None = None,
+    energy_above_hull_max: float | None = None,
+    num_elements_min: int | None = None,
+    num_elements_max: int | None = None,
     chunk_size: int = 10
 ):
     """搜索 Materials Project 材料 (直接调用 MCP 工具)"""
     try:
-        # 构建参数
         params: dict[str, Any] = {"chunk_size": chunk_size}
         if elements:
             params["elements"] = _normalize_elements(elements)
@@ -752,8 +757,15 @@ async def search_materials(
             params["exclude_elements"] = _normalize_elements(exclude_elements)
         if formula:
             params["formula"] = formula.strip()
+        if band_gap_min is not None and band_gap_max is not None:
+            params["band_gap"] = (band_gap_min, band_gap_max)
+        if energy_above_hull_min is not None:
+            params["energy_above_hull_min"] = energy_above_hull_min
+        if energy_above_hull_max is not None:
+            params["energy_above_hull_max"] = energy_above_hull_max
+        if num_elements_min is not None or num_elements_max is not None:
+            params["num_elements"] = (num_elements_min or 1, num_elements_max or 20)
 
-        # 直接调用 MCP 工具获取结构化数据
         result = await invoke_mcp_tool_direct("search_materials_from_mp", params)
         return {"result": result}
     except Exception as e:
@@ -779,6 +791,8 @@ async def search_materials_oqmd(
     band_gap_min: float | None = None,
     band_gap_max: float | None = None,
     stability_max: float = 0.1,
+    num_elements_min: int | None = None,
+    num_elements_max: int | None = None,
     limit: int = 20
 ):
     """OQMD 材料搜索"""
@@ -790,6 +804,10 @@ async def search_materials_oqmd(
             params["band_gap_min"] = band_gap_min
         if band_gap_max is not None:
             params["band_gap_max"] = band_gap_max
+        if num_elements_min is not None:
+            params["num_elements_min"] = num_elements_min
+        if num_elements_max is not None:
+            params["num_elements_max"] = num_elements_max
 
         result = await invoke_mcp_tool_direct("search_materials_from_oqmd", params)
         return {"result": result}
