@@ -734,12 +734,12 @@ async def search_materials(
     elements: str | None = None,
     exclude_elements: str | None = None,
     formula: str | None = None,
-    max_results: int = 10
+    chunk_size: int = 10
 ):
     """搜索 Materials Project 材料 (直接调用 MCP 工具)"""
     try:
         # 构建参数
-        params: dict[str, Any] = {"chunk_size": max_results}
+        params: dict[str, Any] = {"chunk_size": chunk_size}
         if elements:
             params["elements"] = [e.strip() for e in elements.split(",")]
         if exclude_elements:
@@ -756,11 +756,48 @@ async def search_materials(
 
 @app.get("/materials/structure/{material_id}")
 async def get_material_structure(material_id: str):
-    """获取材料结构 (直接调用 MCP 工具)"""
+    """获取 Material Project 材料结构 (直接调用 MCP 工具)"""
     try:
         result = await invoke_mcp_tool_direct(
-            "get_material_structure_from_mp", 
+            "get_material_structure_from_mp",
             {"material_id": material_id, "get_plot": True, "get_sites": True}
+        )
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/materials/search/oqmd")
+async def search_materials_oqmd(
+    elements: str | None = None,
+    band_gap_min: float | None = None,
+    band_gap_max: float | None = None,
+    stability_max: float = 0.1,
+    limit: int = 20
+):
+    """OQMD 材料搜索"""
+    try:
+        params: dict[str, Any] = {"stability_max": stability_max, "limit": limit}
+        if elements:
+            params["elements"] = [e.strip() for e in elements.split(",")]
+        if band_gap_min is not None:
+            params["band_gap_min"] = band_gap_min
+        if band_gap_max is not None:
+            params["band_gap_max"] = band_gap_max
+
+        result = await invoke_mcp_tool_direct("search_materials_from_oqmd", params)
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/materials/structure/oqmd/{entry_id}")
+async def get_material_structure_oqmd(entry_id: int):
+    """获取 OQMD 材料结构"""
+    try:
+        result = await invoke_mcp_tool_direct(
+            "get_material_structure_from_oqmd",
+            {"entry_id": entry_id, "get_plot": True, "get_sites": True}
         )
         return {"result": result}
     except Exception as e:

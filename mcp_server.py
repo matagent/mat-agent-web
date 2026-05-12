@@ -831,11 +831,8 @@ async def search_materials_from_oqmd(
     filter_parts = []
     
     if elements:
-        if len(elements) == 1:
-            filter_parts.append(f"element={elements[0]}")
-        else:
-            element_set = ",".join(elements)
-            filter_parts.append(f"element_set={element_set}")
+        element_set = ",".join(elements)
+        filter_parts.append(f"element_set={element_set}")
     
     if band_gap_min is not None:
         filter_parts.append(f"band_gap>={band_gap_min}")
@@ -945,11 +942,12 @@ async def search_materials_from_mp(
     band_gap: tuple[float, float] | None = None,
     num_elements: tuple[int, int] | None = None,
     formula: str | list[str] | None = None,
-    chunk_size: int | None = 25
+    chunk_size: int | None = 25,
+    energy_above_hull: tuple[float, float] | None = (0.0, 0.1)
 ) -> dict:
     """
     Material Project数据查询工具
-    
+
     Args:
         elements: 包含的元素列表，如 ["Li", "Fe", "O"]
         exclude_elements: 排除的元素列表，如 ["C", "N"]
@@ -958,9 +956,10 @@ async def search_materials_from_mp(
         num_elements: 元素数量范围，如 (2, 4)
         formula: 化学式，如 "LiFeO2" 或 ["LiFeO2", "NaCl"]
         chunk_size: 每块返回数量，默认25
-    
+        energy_above_hull: 形成能范围 (eV/atom)，默认 (0.0, 0.1) 只返回稳定/近稳态材料。设为 None 则不限制
+
     Returns:
-        list[dict]: 材料列表或错误信息
+        list[dict]: 材料列表（按 energy_above_hull 升序，最稳定的排在前面）
     """
     args = {}
     if elements is not None:
@@ -977,6 +976,8 @@ async def search_materials_from_mp(
         args["formula"] = formula
     if chunk_size is not None and chunk_size != 25:
         args["chunk_size"] = chunk_size
+    if energy_above_hull is not None:
+        args["energy_above_hull"] = energy_above_hull
     
     API_KEY = MY_API_KEY
     if not API_KEY:
@@ -997,11 +998,15 @@ async def search_materials_from_mp(
                 search_kwargs["num_elements"] = num_elements
             if formula:
                 search_kwargs["formula"] = formula
-            
-            search_kwargs["fields"] = ["material_id", "formula_pretty", "band_gap", "symmetry"]
+            if energy_above_hull:
+                search_kwargs["energy_above_hull"] = energy_above_hull
+
+            search_kwargs["fields"] = ["material_id", "formula_pretty", "band_gap", "symmetry", "energy_above_hull"]
             chunk_sz = chunk_size if chunk_size else 25
-            
+
             results = mpr.materials.summary.search(**search_kwargs, chunk_size=chunk_sz, num_chunks=1)
+            # 按稳定性排序: energy_above_hull 越小越稳定
+            results = sorted(results, key=lambda r: r.energy_above_hull or 999)
             print(f"查询到 {len(results)} 个材料")
             data = {
                 "data": [
@@ -1009,7 +1014,8 @@ async def search_materials_from_mp(
                         "formula": r.formula_pretty,
                         "material_id": r.material_id,
                         "symmetry": r.symmetry,
-                        "band_gap": r.band_gap
+                        "band_gap": r.band_gap,
+                        "energy_above_hull": r.energy_above_hull
                     } for r in results
                 ]
             }

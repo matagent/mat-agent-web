@@ -483,8 +483,27 @@ def search_materials(elements: str = None, exclude: str = None, formula: str = N
     return call_mcp_api("/materials/search", params=params)
 
 def get_material_structure(material_id: str) -> dict:
-    """获取材料结构"""
+    """获取材料结构 (Material Project)"""
     return call_mcp_api(f"/materials/structure/{material_id}")
+
+
+def search_materials_oqmd(elements: str = None, band_gap_min: float = None,
+                          band_gap_max: float = None, stability_max: float = 0.1,
+                          limit: int = 20) -> dict:
+    """OQMD 材料搜索"""
+    params = {"stability_max": stability_max, "limit": limit}
+    if elements:
+        params["elements"] = elements
+    if band_gap_min is not None:
+        params["band_gap_min"] = band_gap_min
+    if band_gap_max is not None:
+        params["band_gap_max"] = band_gap_max
+    return call_mcp_api("/materials/search/oqmd", params=params)
+
+
+def get_material_structure_oqmd(entry_id: int) -> dict:
+    """获取 OQMD 材料结构"""
+    return call_mcp_api(f"/materials/structure/oqmd/{entry_id}")
 
 def build_structure(**kwargs) -> dict:
     """构建结构"""
@@ -1192,167 +1211,247 @@ def chat_page():
             # 流式传输结束后刷新页面，让聊天框回到最底部
             st.rerun()
 
+def _display_structure_details(result_data):
+    """显示结构详情（MP 和 OQMD 共用）"""
+    struct_data = result_data.get("structure_dict", result_data)
+
+    if "lattice_parameters" in struct_data:
+        lp = struct_data["lattice_parameters"]
+        st.markdown(f"""
+        - a = {lp.get('a', 'N/A')} Å
+        - b = {lp.get('b', 'N/A')} Å
+        - c = {lp.get('c', 'N/A')} Å
+        - α = {lp.get('alpha', 'N/A')}°
+        - β = {lp.get('beta', 'N/A')}°
+        - γ = {lp.get('gamma', 'N/A')}°
+        """)
+
+    if "space_group_symbol" in struct_data:
+        st.markdown(f"**空间群:** {struct_data.get('space_group_symbol', 'N/A')}")
+
+    if "sites" in struct_data:
+        with st.expander("🔬 原子位置"):
+            sites = struct_data["sites"]
+            import pandas as pd
+            if sites and "fractional_coordinates" in sites[0]:
+                sites_df = pd.DataFrame([
+                    {"元素": s.get("element", "N/A"),
+                     "x": s.get("fractional_coordinates", [0,0,0])[0],
+                     "y": s.get("fractional_coordinates", [0,0,0])[1],
+                     "z": s.get("fractional_coordinates", [0,0,0])[2]}
+                    for s in sites
+                ])
+            else:
+                sites_df = pd.DataFrame([
+                    {"元素": s.get("species", [{}])[0].get("element", "N/A"),
+                     "x": s.get("xyz", [0,0,0])[0],
+                     "y": s.get("xyz", [0,0,0])[1],
+                     "z": s.get("xyz", [0,0,0])[2]}
+                    for s in sites
+                ])
+            st.dataframe(sites_df, use_container_width=True)
+
+    if "image_url" in result_data and result_data["image_url"]:
+        st.divider()
+        st.markdown("**📊 结构示意图**")
+        st.image(result_data["image_url"], use_container_width=True)
+
+    if "3d_image_url" in result_data and result_data["3d_image_url"]:
+        st.divider()
+        st.markdown("**🔍 3D 结构可视化**")
+        url_3d = result_data["3d_image_url"]
+        if url_3d.startswith("/"):
+            url_3d = f"http://127.0.0.1:5001{url_3d}"
+        st.markdown(f"[在浏览器中打开3D结构]({url_3d})")
+        st.components.v1.iframe(url_3d, height=500, scrolling=True)
+
+    with st.expander("📋 完整数据"):
+        st.json(result_data)
+
+
 def material_search_page():
     st.markdown('<h1 class="main-title">🔍 材料查询</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="subtitle">从 Materials Project 数据库搜索材料</p>', unsafe_allow_html=True)
-    
+
     if not st.session_state.mcp_connected:
         st.warning("⚠️ MCP 服务未连接")
         return
-    
-    with st.container():
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**🔬 搜索条件**")
-            
-            elements = st.text_input("包含元素 (逗号分隔)", placeholder="Li, Fe, O")
-            exclude = st.text_input("排除元素", placeholder="H, He")
-            formula = st.text_input("化学式", placeholder="LiFeO2")
-            chunk_size = st.slider("返回数量", 1, 50, 10)
-            
-            search_btn = st.button("🔍 开始搜索", type="primary", use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**📊 搜索结果**")
-            
-            # 搜索按钮处理
-            if search_btn:
-                if not any([elements, exclude, formula]):
-                    st.warning("请至少输入一个搜索条件")
-                else:
-                    with st.spinner("搜索中..."):
-                        result = search_materials(elements, exclude, formula, chunk_size)
-                        
-                        if "error" in result:
-                            st.error(f"搜索失败: {result['error']}")
-                            st.session_state.search_results = None
-                        else:
-                            # 使用统一解析函数处理结果
-                            materials = parse_mcp_result(result)
-                            st.session_state.search_results = materials
-            
-            # 显示搜索结果（独立于搜索按钮状态）
-            if st.session_state.get("search_results"):
-                materials = st.session_state.search_results
-                
-                if isinstance(materials, dict) and "error" in materials:
-                    st.error(f"解析失败: {materials['error']}")
-                elif isinstance(materials, list) and len(materials) > 0:
-                    st.success(f"找到 {len(materials)} 个材料")
-                    
-                    for mat in materials:
-                        # 支持新旧两种字段名格式
-                        mat_id = mat.get('entry_id') or mat.get('material_id')
-                        formula = mat.get('name') or mat.get('formula_pretty') or mat.get('formula', 'Unknown')
-                        with st.expander(f"{formula} ({mat_id})"):
-                            col_a, col_b = st.columns(2)
-                            col_a.metric("带隙", f"{mat.get('band_gap', 'N/A')} eV")
-                            
-                            # 处理不同的对称性格式
-                            symmetry = mat.get('spacegroup') or mat.get('symmetry', {})
-                            if isinstance(symmetry, dict):
-                                crystal_system = symmetry.get('crystal_system', 'N/A')
+
+    tab_mp, tab_oqmd = st.tabs(["Materials Project", "OQMD"])
+
+    # ==================== Materials Project Tab ====================
+    with tab_mp:
+        st.markdown('<p class="subtitle">从 Materials Project 数据库搜索材料</p>', unsafe_allow_html=True)
+
+        with st.container():
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown("**🔬 搜索条件**")
+
+                elements = st.text_input("包含元素 (逗号分隔)", placeholder="Li, Fe, O", key="mp_elements")
+                exclude = st.text_input("排除元素", placeholder="H, He", key="mp_exclude")
+                formula = st.text_input("化学式", placeholder="LiFeO2", key="mp_formula")
+                chunk_size = st.slider("返回数量", 1, 50, 10, key="mp_chunk_size")
+
+                search_btn_mp = st.button("🔍 开始搜索", type="primary", use_container_width=True, key="mp_search_btn")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with col2:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown("**📊 搜索结果**")
+
+                if search_btn_mp:
+                    if not any([elements, exclude, formula]):
+                        st.warning("请至少输入一个搜索条件")
+                    else:
+                        with st.spinner("搜索中..."):
+                            result = search_materials(elements, exclude, formula, chunk_size)
+                            if "error" in result:
+                                st.error(f"搜索失败: {result['error']}")
+                                st.session_state.mp_search_results = None
                             else:
-                                crystal_system = str(symmetry)
-                            col_b.metric("晶系", crystal_system)
-                            
-                            # 使用独立的 key 存储每个材料的结构数据
-                            struct_key = f"struct_{mat_id}"
-                            
-                            if col_b.button("📊 查看结构", key=f"view_{mat_id}"):
-                                with st.spinner("获取结构中..."):
-                                    struct = get_material_structure(mat_id)
+                                st.session_state.mp_search_results = parse_mcp_result(result)
+
+                if st.session_state.get("mp_search_results"):
+                    materials = st.session_state.mp_search_results
+
+                    if isinstance(materials, dict) and "error" in materials:
+                        st.error(f"解析失败: {materials['error']}")
+                    elif isinstance(materials, list) and len(materials) > 0:
+                        st.success(f"找到 {len(materials)} 个材料")
+
+                        for mat in materials:
+                            mat_id = mat.get('entry_id') or mat.get('material_id')
+                            mat_formula = mat.get('name') or mat.get('formula_pretty') or mat.get('formula', 'Unknown')
+                            with st.expander(f"{mat_formula} ({mat_id})"):
+                                col_a, col_b = st.columns(2)
+                                col_a.metric("带隙", f"{mat.get('band_gap', 'N/A')} eV")
+
+                                symmetry = mat.get('spacegroup') or mat.get('symmetry', {})
+                                if isinstance(symmetry, dict):
+                                    crystal_system = symmetry.get('crystal_system', 'N/A')
+                                else:
+                                    crystal_system = str(symmetry)
+                                col_b.metric("晶系", crystal_system)
+
+                                if "energy_above_hull" in mat and mat["energy_above_hull"] is not None:
+                                    st.caption(f"形成能: {mat['energy_above_hull']:.4f} eV/atom")
+
+                                struct_key = f"mp_struct_{mat_id}"
+                                if col_b.button("📊 查看结构", key=f"mp_view_{mat_id}"):
+                                    with st.spinner("获取结构中..."):
+                                        struct = get_material_structure(mat_id)
+                                        if "error" not in struct:
+                                            st.session_state[struct_key] = parse_mcp_result(struct)
+                                            st.rerun()
+                                        else:
+                                            st.error(struct.get("error"))
+
+                                if struct_key in st.session_state:
+                                    st.divider()
+                                    st.markdown("**📐 结构详情**")
+                                    _display_structure_details(st.session_state[struct_key])
+                    else:
+                        st.info("未找到结果或结果格式不正确")
+
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    # ==================== OQMD Tab ====================
+    with tab_oqmd:
+        st.markdown('<p class="subtitle">从 OQMD 数据库搜索材料</p>', unsafe_allow_html=True)
+
+        with st.container():
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown("**🔬 搜索条件**")
+
+                oqmd_elements = st.text_input("包含元素 (逗号分隔)", placeholder="Li, Fe, O", key="oqmd_elements")
+                oqmd_bg_min = st.number_input("最小带隙 (eV)", value=None, step=0.1, format="%.1f", key="oqmd_bg_min", help="留空不限制")
+                oqmd_bg_max = st.number_input("最大带隙 (eV)", value=None, step=0.1, format="%.1f", key="oqmd_bg_max", help="留空不限制")
+                oqmd_stability = st.slider("稳定性上限 (eV/atom)", 0.0, 2.0, 0.1, 0.01, key="oqmd_stability",
+                                           help="hull distance，0 = 最稳定")
+                oqmd_limit = st.slider("返回数量", 1, 100, 20, key="oqmd_limit")
+
+                search_btn_oqmd = st.button("🔍 开始搜索", type="primary", use_container_width=True, key="oqmd_search_btn")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with col2:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown("**📊 搜索结果**")
+
+                if search_btn_oqmd:
+                    if not oqmd_elements:
+                        st.warning("请输入包含元素")
+                    else:
+                        with st.spinner("搜索中... (OQMD 响应较慢，请耐心等待)"):
+                            result = search_materials_oqmd(
+                                elements=oqmd_elements,
+                                band_gap_min=oqmd_bg_min,
+                                band_gap_max=oqmd_bg_max,
+                                stability_max=oqmd_stability,
+                                limit=oqmd_limit
+                            )
+                            if "error" in result:
+                                st.error(f"搜索失败: {result['error']}")
+                                st.session_state.oqmd_search_results = None
+                            else:
+                                parsed = parse_mcp_result(result)
+                                # OQMD 返回 {"data": [...], "meta": {...}}
+                                if isinstance(parsed, dict) and "data" in parsed:
+                                    st.session_state.oqmd_search_results = parsed
+                                elif isinstance(parsed, list):
+                                    st.session_state.oqmd_search_results = parsed
+                                else:
+                                    st.session_state.oqmd_search_results = parsed
+
+                if st.session_state.get("oqmd_search_results"):
+                    oqmd_data = st.session_state.oqmd_search_results
+
+                    if isinstance(oqmd_data, dict) and "data" in oqmd_data:
+                        materials = oqmd_data["data"]
+                        meta = oqmd_data.get("meta", {})
+                        total = meta.get("data_available", len(materials))
+                        st.success(f"找到 {len(materials)} 个材料 (共 {total} 个可用)")
+                    elif isinstance(oqmd_data, list):
+                        materials = oqmd_data
+                        st.success(f"找到 {len(materials)} 个材料")
+                    elif isinstance(oqmd_data, dict) and "error" in oqmd_data:
+                        st.error(f"搜索失败: {oqmd_data['error']}")
+                        materials = []
+                    else:
+                        materials = []
+                        st.info("未找到结果或结果格式不正确")
+
+                    for mat in materials:
+                        entry_id = mat.get('entry_id', 'Unknown')
+                        name = mat.get('name', 'Unknown')
+                        with st.expander(f"{name} (entry: {entry_id})"):
+                            col_a, col_b, col_c = st.columns(3)
+                            col_a.metric("带隙", f"{mat.get('band_gap', 'N/A')} eV")
+                            col_b.metric("稳定性", f"{mat.get('stability', 'N/A')}")
+                            col_c.metric("形成能", f"{mat.get('delta_e', 'N/A')} eV/atom")
+
+                            st.caption(f"空间群: {mat.get('spacegroup', 'N/A')} | 元素种类: {mat.get('ntypes', 'N/A')}")
+
+                            struct_key = f"oqmd_struct_{entry_id}"
+                            if st.button("📊 查看结构", key=f"oqmd_view_{entry_id}"):
+                                with st.spinner("获取结构中... (OQMD 响应较慢)"):
+                                    struct = get_material_structure_oqmd(entry_id)
                                     if "error" not in struct:
-                                        # 使用统一解析函数处理结果
-                                        result_data = parse_mcp_result(struct)
-                                        # 存储完整的结果数据（包含 image_url, 3d_image_url, structure_dict）
-                                        st.session_state[struct_key] = result_data
-                                        # 强制重新运行以显示结构
+                                        st.session_state[struct_key] = parse_mcp_result(struct)
                                         st.rerun()
                                     else:
                                         st.error(struct.get("error"))
-                            
-                            # 显示已查看的结构（检查当前材料的结构数据）
+
                             if struct_key in st.session_state:
                                 st.divider()
                                 st.markdown("**📐 结构详情**")
-                                result_data = st.session_state[struct_key]
-                                
-                                # 获取 structure_dict（实际的结构数据）
-                                struct_data = result_data.get("structure_dict", result_data)
-                                
-                                # 显示晶格参数
-                                if "lattice_parameters" in struct_data:
-                                    lp = struct_data["lattice_parameters"]
-                                    st.markdown(f"""
-                                    - a = {lp.get('a', 'N/A')} Å
-                                    - b = {lp.get('b', 'N/A')} Å
-                                    - c = {lp.get('c', 'N/A')} Å
-                                    - α = {lp.get('alpha', 'N/A')}°
-                                    - β = {lp.get('beta', 'N/A')}°
-                                    - γ = {lp.get('gamma', 'N/A')}°
-                                    """)
-                                
-                                # 显示空间群
-                                if "space_group_symbol" in struct_data:
-                                    st.markdown(f"**空间群:** {struct_data.get('space_group_symbol', 'N/A')}")
-                                
-                                # 显示原子位置
-                                if "sites" in struct_data:
-                                    with st.expander("🔬 原子位置"):
-                                        sites = struct_data["sites"]
-                                        import pandas as pd
-                                        # 处理两种可能的格式
-                                        if sites and "fractional_coordinates" in sites[0]:
-                                            # MCP 格式: [{"element": "Li", "fractional_coordinates": [0,0,0]}]
-                                            sites_df = pd.DataFrame([
-                                                {"元素": s.get("element", "N/A"),
-                                                 "x": s.get("fractional_coordinates", [0,0,0])[0],
-                                                 "y": s.get("fractional_coordinates", [0,0,0])[1],
-                                                 "z": s.get("fractional_coordinates", [0,0,0])[2]}
-                                                for s in sites
-                                            ])
-                                        else:
-                                            # 旧格式: [{"species": [{"element": "Li"}], "xyz": [0,0,0]}]
-                                            sites_df = pd.DataFrame([
-                                                {"元素": s.get("species", [{}])[0].get("element", "N/A"),
-                                                 "x": s.get("xyz", [0,0,0])[0],
-                                                 "y": s.get("xyz", [0,0,0])[1],
-                                                 "z": s.get("xyz", [0,0,0])[2]}
-                                                for s in sites
-                                            ])
-                                        st.dataframe(sites_df, use_container_width=True)
-                                
-                                # 显示结构图片（从 result_data 根级别获取）
-                                if "image_url" in result_data and result_data["image_url"]:
-                                    st.divider()
-                                    st.markdown("**📊 结构示意图**")
-                                    st.image(result_data["image_url"], use_container_width=True)
-                                
-                                # 显示3D可视化链接（从 result_data 根级别获取）
-                                if "3d_image_url" in result_data and result_data["3d_image_url"]:
-                                    st.divider()
-                                    st.markdown("**🔍 3D 结构可视化**")
-                                    url_3d = result_data["3d_image_url"]
-                                    # 确保URL是完整的
-                                    if url_3d.startswith("/"):
-                                        url_3d = f"http://127.0.0.1:5001{url_3d}"
-                                    st.markdown(f"[在浏览器中打开3D结构]({url_3d})")
-                                    # 使用iframe嵌入3D视图
-                                    st.components.v1.iframe(url_3d, height=500, scrolling=True)
-                                
-                                # 显示完整数据
-                                with st.expander("📋 完整数据"):
-                                    st.json(result_data)
-                else:
-                    st.info("未找到结果或结果格式不正确")
-            
-            st.markdown('</div>', unsafe_allow_html=True)
+                                _display_structure_details(st.session_state[struct_key])
 
+                st.markdown('</div>', unsafe_allow_html=True)
 def structure_builder_page():
     st.markdown('<h1 class="main-title">📊 结构建模</h1>', unsafe_allow_html=True)
     st.markdown('<p class="subtitle">构建自定义晶体结构</p>', unsafe_allow_html=True)
