@@ -998,13 +998,16 @@ async def search_materials_from_mp(
                 search_kwargs["num_elements"] = num_elements
             if formula:
                 search_kwargs["formula"] = formula
-            if energy_above_hull:
-                search_kwargs["energy_above_hull"] = energy_above_hull
 
             search_kwargs["fields"] = ["material_id", "formula_pretty", "band_gap", "symmetry", "energy_above_hull"]
             chunk_sz = chunk_size if chunk_size else 25
 
             results = mpr.materials.summary.search(**search_kwargs, chunk_size=chunk_sz, num_chunks=1)
+            # 在 Python 端按 energy_above_hull 过滤和排序（MP API 不支持此过滤参数）
+            if energy_above_hull:
+                lo, hi = energy_above_hull
+                results = [r for r in results
+                           if r.energy_above_hull is not None and lo <= r.energy_above_hull <= hi]
             # 按稳定性排序: energy_above_hull 越小越稳定
             results = sorted(results, key=lambda r: r.energy_above_hull or 999)
             print(f"查询到 {len(results)} 个材料")
