@@ -248,3 +248,39 @@ def predict_bandgap(formula: str | list[str]) -> list:
     dmatrix = xgboost.DMatrix(feature_vector)
     prediction = model.predict(dmatrix)
     return prediction.tolist()
+
+
+def predict_bandgap_gga_hse(formula: str | list[str], gap_gga: float | list[float]) -> list:
+    """
+    使用 GGA→HSE 修正模型预测 HSE 带隙
+    需要化学式 + GGA 带隙值
+
+    Args:
+        formula: 化学式字符串或列表
+        gap_gga: GGA 带隙值 (eV)，单个或列表
+
+    Returns:
+        list: 预测的 HSE 带隙值
+    """
+    model = xgboost.Booster()
+    model.load_model("./myml/xgb_gga_hse_model.json")
+
+    if isinstance(formula, str):
+        df = pd.DataFrame([{"formula": formula}])
+        gga_values = [gap_gga] if isinstance(gap_gga, (int, float)) else gap_gga
+    elif isinstance(formula, list):
+        df = pd.DataFrame([{"formula": f} for f in formula])
+        if isinstance(gap_gga, (int, float)):
+            gga_values = [gap_gga] * len(formula)
+        else:
+            gga_values = list(gap_gga)
+
+    df["normalized_formula"] = df["formula"].apply(normalize_formula)
+    features = get_all_features(df)
+    features["gap_gga"] = gga_values
+
+    feature_names = model.feature_names
+    feature_vector = features[feature_names]
+    dmatrix = xgboost.DMatrix(feature_vector)
+    prediction = model.predict(dmatrix)
+    return prediction.tolist()

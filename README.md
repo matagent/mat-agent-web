@@ -191,7 +191,7 @@ Content-Type: application/json
 {
   "session_id": "uuid",
   "message": "搜索含锂的材料",
-  "model": "deepseek-chat"
+  "model": "deepseek-v4-flash"
 }
 
 # 流式聊天

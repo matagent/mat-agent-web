@@ -1607,6 +1607,28 @@ async def predict_band_gap(formula: str | list[str]) -> dict:
     except Exception as e:
         return {"args": args, "returns": {"error": str(e), "message": f"预测材料 {formula} 的带隙值失败"}}
 
+
+@mcp.tool()
+async def predict_band_gap_gga_hse(formula: str | list[str], gap_gga: float | list[float]) -> dict:
+    """
+    使用 GGA→HSE 带隙修正模型预测 HSE 带隙，需要化学式 + GGA 带隙值（通常来自 Materials Project 或 OQMD 的 GGA 计算结果）
+
+    Args:
+        formula: 化学式，可以是单个字符串如 "LiFeO2" 或列表如 ["LiFeO2", "NaCl"]
+        gap_gga: GGA 带隙值(eV)，可以是单个值或列表
+
+    Returns:
+        dict: 包含 predicted_hse_band_gap
+    """
+    args = {"formula": formula, "gap_gga": gap_gga}
+    from myml import bandgap_predict as mm
+    try:
+        result = mm.predict_bandgap_gga_hse(formula, gap_gga)
+        return {"args": args, "returns": {"predicted_hse_band_gap": result}}
+    except Exception as e:
+        return {"args": args, "returns": {"error": str(e), "message": f"GGA→HSE 预测失败"}}
+
+
 @mcp.tool()
 async def predict_with_alignn(
     cif_path: str, 
@@ -1685,6 +1707,208 @@ async def predict_with_alignn(
                 "message": "调用本地CIF预测工具失败"
             }
         }
+
+
+# ============ Wyckoff 位置查询工具 ============
+
+NUMBER_TO_SYMBOL = {
+    1: "P1", 2: "P-1", 3: "P2", 4: "P21", 5: "C2",
+    6: "Pm", 7: "Pc", 8: "C2/m", 9: "C2/c", 10: "P2/m",
+    11: "P21/m", 12: "C2/m", 13: "P2/c", 14: "P21/c", 15: "C2/c",
+    16: "P222", 17: "P2212", 18: "P2122", 19: "P22121", 20: "C2221",
+    21: "C222", 22: "F222", 23: "I222", 24: "I2121",
+    25: "Pmm2", 26: "Pmc21", 27: "Pcc2", 28: "Pma2", 29: "Pca21",
+    30: "Pnc2", 31: "Pmn21", 32: "Pba2", 33: "Pna21", 34: "Pnn2",
+    35: "Cmm2", 36: "Cmc21", 37: "Ccc2", 38: "Amm2", 39: "Aem2",
+    40: "Ama2", 41: "Aea2", 42: "Fmm2", 43: "Fdd2", 44: "Imm2",
+    45: "Iba2", 46: "Ima2",
+    47: "Pmmm", 48: "Pnnn", 49: "Pccm", 50: "Pban", 51: "Pmma",
+    52: "Pnna", 53: "Pmna", 54: "Pcca", 55: "Pbam", 56: "Pccn",
+    57: "Pbcm", 58: "Pnnm", 59: "Pmmn", 60: "Pbcn", 61: "Pbca",
+    62: "Pnma", 63: "Cmcm", 64: "Cmce", 65: "Cmmm", 66: "Cccm",
+    67: "Cmma", 68: "Ccca", 69: "Fmmm", 70: "Fddd", 71: "Immm",
+    72: "Ibam", 73: "Ibca", 74: "Imma",
+    75: "P4", 76: "P41", 77: "P42", 78: "P43", 79: "I4",
+    80: "I41", 81: "P-4", 82: "I-4", 83: "P4/m", 84: "P42/m",
+    85: "P4/n", 86: "P42/n", 87: "I4/m", 88: "I41/a",
+    89: "P222", 90: "P2212", 91: "P4122", 92: "P41212", 93: "P4222",
+    94: "P4212", 95: "P4322", 96: "P4232", 97: "I222", 98: "I2212",
+    99: "P4mm", 100: "P4bm", 101: "P42cm", 102: "P42nm", 103: "P4cc",
+    104: "P4nc", 105: "P42mc", 106: "P42bc", 107: "I4mm", 108: "I4cm",
+    109: "I41md", 110: "I41cd", 111: "P-42m", 112: "P-42c", 113: "P-421m",
+    114: "P-421c", 115: "P-4m2", 116: "P-4c2", 117: "P-4b2", 118: "P-4n2",
+    119: "I-4m2", 120: "I-4c2", 121: "I-42m", 122: "I-42d",
+    123: "P4/mmm", 124: "P4/mcc", 125: "P4/nbm", 126: "P4/nnc",
+    127: "P4/mbm", 128: "P4/mnc", 129: "P4/nmm", 130: "P4/ncc",
+    131: "P42/mmc", 132: "P42/mcm", 133: "P42/nbc", 134: "P42/nnm",
+    135: "P42/mbc", 136: "P42/mnm", 137: "P42/nmc", 138: "P42/ncm",
+    139: "I4/mmm", 140: "I4/mcm", 141: "I41/amd", 142: "I41/acd",
+    143: "P3", 144: "P31", 145: "P32", 146: "R3", 147: "P-3",
+    148: "R-3", 149: "P312", 150: "P321", 151: "P3112", 152: "P3121",
+    153: "P3212", 154: "P3221", 155: "R32", 156: "P3m1", 157: "P31m",
+    158: "P3c1", 159: "P31c", 160: "R3m", 161: "R3c", 162: "P-31m",
+    163: "P-31c", 164: "P-3m1", 165: "P-3c1",
+    166: "R-3m", 167: "R-3c",
+    168: "P6", 169: "P61", 170: "P65", 171: "P62", 172: "P64",
+    173: "P63", 174: "P-6", 175: "P6/m", 176: "P63/m", 177: "P622",
+    178: "P6122", 179: "P6522", 180: "P6222", 181: "P6422", 182: "P6322",
+    183: "P6mm", 184: "P6cc", 185: "P63cm", 186: "P63mc", 187: "P-6m2",
+    188: "P-6c2", 189: "P-62m", 190: "P-62c", 191: "P6/mmm", 192: "P6/mcc",
+    193: "P63/mcm", 194: "P63/mmc",
+    195: "P23", 196: "F23", 197: "I23", 198: "P213", 199: "I213",
+    200: "Pm-3", 201: "Pn-3", 202: "Fm-3", 203: "Fd-3", 204: "Im-3",
+    205: "Pa-3", 206: "Ia-3", 207: "P432", 208: "P4232", 209: "F432",
+    210: "F4132", 211: "I432", 212: "P4332", 213: "P4132", 214: "I4132",
+    215: "P-43m", 216: "F-43m", 217: "I-43m", 218: "P-43n", 219: "F-43c",
+    220: "I-43d", 221: "Pm-3m", 222: "Pn-3n", 223: "Pm-3n", 224: "Pn-3m",
+    225: "Fm-3m", 226: "Fm-3c", 227: "Fd-3m", 228: "Fd-3c", 229: "Im-3m",
+    230: "Ia-3d",
+}
+
+_SYMBOL_TO_NUMBER = {
+    "P1": 1, "P-1": 2, "P2": 3, "P21": 4, "C2": 5,
+    "PM": 6, "PC": 7, "CM": 8, "CC": 9,
+    "P2/M": 10, "P21/M": 11, "C2/M": 12,
+    "P2/C": 13, "P21/C": 14, "C2/C": 15,
+    "P222": 16, "P2212": 17, "P2122": 18, "P22121": 19, "C2221": 20,
+    "C222": 21, "F222": 22, "I222": 23, "I2121": 24,
+    "PMM2": 25, "PMC21": 26, "PCC2": 27, "PMA2": 28, "PCA21": 29,
+    "PNC2": 30, "PMN21": 31, "PBA2": 32, "PNA21": 33, "PNN2": 34,
+    "CMM2": 35, "CMC21": 36, "CCC2": 37, "AMM2": 38, "AEM2": 39,
+    "AMA2": 40, "AEA2": 41, "FMM2": 42, "FDD2": 43, "IMM2": 44,
+    "IBA2": 45, "IMA2": 46,
+    "PMMM": 47, "PNNN": 48, "PCCM": 49, "PBAN": 50, "PMMA": 51,
+    "PNNA": 52, "PMNA": 53, "PCCA": 54, "PBAM": 55, "PCCN": 56,
+    "PBCM": 57, "PNNM": 58, "PMMN": 59, "PBCN": 60, "PBCA": 61,
+    "PNMA": 62, "CMCM": 63, "CMCE": 64, "CMMM": 65, "CCCM": 66,
+    "CMMA": 67, "CCCA": 68, "FMMM": 69, "FDDD": 70, "IMMM": 71,
+    "IBAM": 72, "IBCA": 73, "IMMA": 74,
+    "P4": 75, "P41": 76, "P42": 77, "P43": 78, "I4": 79, "I41": 80,
+    "P-4": 81, "I-4": 82, "P4/M": 83, "P42/M": 84,
+    "P4/N": 85, "P42/N": 86, "I4/M": 87, "I41/A": 88,
+    "P222": 89, "P2212": 90, "P4122": 91, "P41212": 92,
+    "P4222": 93, "P4212": 94, "P4322": 95, "P4232": 96,
+    "I222": 97, "I2212": 98,
+    "P4MM": 99, "P4BM": 100, "P42CM": 101, "P42NM": 102,
+    "P4CC": 103, "P4NC": 104, "P42MC": 105, "P42BC": 106,
+    "I4MM": 107, "I4CM": 108, "I41MD": 109, "I41CD": 110,
+    "P-42M": 111, "P-42C": 112, "P-421M": 113, "P-421C": 114,
+    "P-4M2": 115, "P-4C2": 116, "P-4B2": 117, "P-4N2": 118,
+    "I-4M2": 119, "I-4C2": 120, "I-42M": 121, "I-42D": 122,
+    "P4/MMM": 123, "P4/MCC": 124, "P4/NBM": 125, "P4/NNC": 126,
+    "P4/MBM": 127, "P4/MNC": 128, "P4/NMM": 129, "P4/NCC": 130,
+    "P42/MMC": 131, "P42/MCM": 132, "P42/NBC": 133, "P42/NNM": 134,
+    "P42/MBC": 135, "P42/MNM": 136, "P42/NMC": 137, "P42/NCM": 138,
+    "I4/MMM": 139, "I4/MCM": 140, "I41/AMD": 141, "I41/ACD": 142,
+    "P3": 143, "P31": 144, "P32": 145, "R3": 146,
+    "P-3": 147, "R-3": 148, "P312": 149, "P321": 150,
+    "P3112": 151, "P3121": 152, "P3212": 153, "P3221": 154, "R32": 155,
+    "P3M1": 156, "P31M": 157, "P3C1": 158, "P31C": 159,
+    "R3M": 160, "R3C": 161, "P-31M": 162, "P-31C": 163,
+    "P-3M1": 164, "P-3C1": 165, "R-3M": 166, "R-3C": 167,
+    "P6": 168, "P61": 169, "P65": 170, "P62": 171, "P64": 172, "P63": 173,
+    "P-6": 174, "P6/M": 175, "P63/M": 176,
+    "P622": 177, "P6122": 178, "P6522": 179, "P6222": 180,
+    "P6422": 181, "P6322": 182,
+    "P6MM": 183, "P6CC": 184, "P63CM": 185, "P63MC": 186,
+    "P-6M2": 187, "P-6C2": 188, "P-62M": 189, "P-62C": 190,
+    "P6/MMM": 191, "P6/MCC": 192, "P63/MCM": 193, "P63/MMC": 194,
+    "P23": 195, "F23": 196, "I23": 197, "P213": 198, "I213": 199,
+    "PM-3": 200, "PN-3": 201, "FM-3": 202, "FD-3": 203, "IM-3": 204,
+    "PA-3": 205, "IA-3": 206,
+    "P432": 207, "P4232": 208, "F432": 209, "F4132": 210,
+    "I432": 211, "P4332": 212, "P4132": 213, "I4132": 214,
+    "P-43M": 215, "F-43M": 216, "I-43M": 217, "P-43N": 218,
+    "F-43C": 219, "I-43D": 220,
+    "PM-3M": 221, "PN-3N": 222, "PM-3N": 223, "PN-3M": 224,
+    "FM-3M": 225, "FM-3C": 226, "FD-3M": 227, "FD-3C": 228,
+    "IM-3M": 229, "IA-3D": 230,
+}
+
+
+def _normalize_symbol(s):
+    return s.upper().replace("-", "").replace("_", "").replace(" ", "").replace("'", "")
+
+
+def _crystal_system(num):
+    if 1 <= num <= 2: return "三斜 (Triclinic)"
+    elif 3 <= num <= 15: return "单斜 (Monoclinic)"
+    elif 16 <= num <= 74: return "正交 (Orthorhombic)"
+    elif 75 <= num <= 142: return "四方 (Tetragonal)"
+    elif 143 <= num <= 167: return "三方 (Trigonal)"
+    elif 168 <= num <= 194: return "六方 (Hexagonal)"
+    elif 195 <= num <= 230: return "立方 (Cubic)"
+    return "未知"
+
+
+def _get_wyckoff_number(spacegroup: str) -> int | None:
+    """将输入解析为空间群编号：纯数字直接转 int，否则按符号查表"""
+    try:
+        num = int(spacegroup)
+        if 1 <= num <= 230:
+            return num
+        return None
+    except ValueError:
+        normalized = _normalize_symbol(spacegroup)
+        for sym, num in _SYMBOL_TO_NUMBER.items():
+            if _normalize_symbol(sym) == normalized:
+                return num
+        return None
+
+
+@mcp.tool()
+async def get_wyckoff_positions(spacegroup: str) -> dict:
+    """
+    根据空间群编号 (1-230) 或国际符号 (如 "Fm-3m", "P42/mnm") 获取 Wyckoff 位置信息
+
+    Args:
+        spacegroup: 空间群编号（如 "225"）或国际符号（如 "Fm-3m"，大小写不敏感）
+
+    Returns:
+        dict: 包含 spacegroup_number, symbol, crystal_system, wyckoff_positions
+    """
+    import wyckoff
+    from fractions import Fraction
+
+    number = _get_wyckoff_number(spacegroup)
+    if number is None:
+        return {"args": {"spacegroup": spacegroup}, "returns": {"error": f"无法识别的空间群: '{spacegroup}'，请输入 1-230 的编号或标准国际符号"}}
+
+    symbol = NUMBER_TO_SYMBOL.get(number, str(number))
+
+    def _fmt(val):
+        if isinstance(val, Fraction):
+            return f"{float(val):.6g}"
+        return str(val)
+
+    db = wyckoff.WyckoffDatabase()
+    sg_data = db.data.get(str(number))
+    if not sg_data:
+        return {"args": {"spacegroup": spacegroup}, "returns": {"error": f"数据库中未找到空间群 {number}"}}
+
+    positions = []
+    for wp in sg_data.wyckoff_positions:
+        if wp.coordinates:
+            coord = wp.coordinates[0]
+            coord_str = f"({_fmt(coord[0])}, {_fmt(coord[1])}, {_fmt(coord[2])})"
+        else:
+            coord_str = None
+        positions.append({
+            "label": wp.label,
+            "multiplicity": wp.multiplicity,
+            "site_symmetry": wp.site_symmetry,
+            "coordinates": coord_str,
+        })
+
+    return {
+        "args": {"spacegroup": spacegroup},
+        "returns": {
+            "spacegroup_number": number,
+            "symbol": symbol,
+            "crystal_system": _crystal_system(number),
+            "wyckoff_positions": positions,
+        }
+    }
 
 
 # ============ 主程序入口 ============

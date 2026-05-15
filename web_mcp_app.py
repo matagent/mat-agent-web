@@ -53,7 +53,7 @@ if "mcp_connected" not in st.session_state:
     st.session_state.mcp_connected = False
 
 if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "deepseek-chat"
+    st.session_state.selected_model = "deepseek-v4-flash"
 
 # ============ Logo 显示函数 ============
 def show_logo():
@@ -384,7 +384,7 @@ def chat_with_mcp(message: str) -> dict:
         return {"type": "error", "message": f"请求失败: {str(e)}"}
 
 
-def chat_with_mcp_stream(message: str, model: str = "deepseek-chat"):
+def chat_with_mcp_stream(message: str, model: str = "deepseek-v4-flash"):
     """
     通过 MCP 与 Agent 进行流式对话
     生成器yield格式: (event_type, data)
@@ -463,6 +463,11 @@ def add_chat_message_via_api(session_id: str, role: str, content: str, tool_resu
 def predict_bandgap(formula: str) -> dict:
     """预测带隙"""
     return call_mcp_api("/predict_bandgap", params={"formula": formula})
+
+
+def predict_bandgap_gga_hse(formula: str, gap_gga: float) -> dict:
+    """GGA→HSE 带隙修正预测"""
+    return call_mcp_api("/predict_bandgap_gga_hse", params={"formula": formula, "gap_gga": gap_gga})
 
 def predict_with_alignn(cif_path: str, properties: list = None, keep_temp_files: bool = False) -> dict:
     """使用 ALIGNN 进行多性质预测"""
@@ -989,8 +994,8 @@ def chat_page():
         with col_model:
             st.session_state.selected_model = st.selectbox(
                 "模型",
-                options=["deepseek-chat", "deepseek-reasoner", "glm-5"],
-                index=["deepseek-chat", "deepseek-reasoner", "glm-5"].index(st.session_state.selected_model),
+                options=["deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.6", "kimi-k2.5", "glm-5"],
+                index=["deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.6", "kimi-k2.5", "glm-5"].index(st.session_state.selected_model),
                 label_visibility="collapsed"
             )
         
@@ -1643,44 +1648,72 @@ def ml_prediction_page():
     
     # ========== 标签页 1: 快速带隙预测 ==========
     with tabs[0]:
+        # 预测模式选择
+        pred_mode = st.radio(
+            "预测模式",
+            options=["化学式预测 (纯ML)", "GGA→HSE 修正预测"],
+            horizontal=True,
+            key="bg_pred_mode",
+        )
+
         col1, col2 = st.columns([1, 2])
-        
+
         with col1:
             st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**🔮 带隙预测**")
-            
-            formula = st.text_input("化学式", placeholder="例如: SiO2, LiFePO4", key="bg_formula")
-            
-            if st.button("开始预测", type="primary", use_container_width=True, key="bg_predict_btn"):
-                if not formula:
-                    st.warning("请输入化学式")
-                else:
-                    with st.spinner("预测中..."):
+            if pred_mode == "GGA→HSE 修正预测":
+                st.markdown("**🔮 GGA→HSE 带隙修正**")
+                formula = st.text_input("化学式", placeholder="例如: SiO2, LiFeO4", key="bg_formula")
+                gap_gga = st.number_input("GGA 带隙 (eV)", min_value=0.0, step=0.01, value=1.0, format="%.3f", key="bg_gga_gap")
+                btn_disabled = not formula
+            else:
+                st.markdown("**🔮 带隙预测**")
+                formula = st.text_input("化学式", placeholder="例如: SiO2, LiFePO4", key="bg_formula")
+                gap_gga = None
+                btn_disabled = not formula
+
+            if st.button("开始预测", type="primary", use_container_width=True, key="bg_predict_btn", disabled=btn_disabled):
+                with st.spinner("预测中..."):
+                    if pred_mode == "GGA→HSE 修正预测":
+                        result = predict_bandgap_gga_hse(formula, gap_gga)
+                    else:
                         result = predict_bandgap(formula)
-                        
-                        if "error" in result:
-                            st.error(result["error"])
-                        else:
-                            st.session_state.prediction_result = result
-                            st.success("预测完成!")
-            
+
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.session_state.prediction_result = result
+                        st.session_state.prediction_mode = pred_mode
+                        st.success("预测完成!")
+
             st.markdown('</div>', unsafe_allow_html=True)
-        
+
         with col2:
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown("**📊 预测结果**")
-            
+
             if "prediction_result" in st.session_state:
                 result = st.session_state.prediction_result
                 try:
                     parsed = parse_mcp_result(result)
-                    
-                    if isinstance(parsed, dict) and "predicted_band_gap" in parsed:
-                        gap = parsed["predicted_band_gap"]
-                        if isinstance(gap, list) and len(gap) > 0:
-                            st.metric("预测带隙", f"{gap[0]:.4f} eV")
+                    mode = st.session_state.get("prediction_mode", "")
+
+                    if isinstance(parsed, dict):
+                        if "predicted_hse_band_gap" in parsed:
+                            gap = parsed["predicted_hse_band_gap"]
+                            label = "预测 HSE 带隙"
+                        elif "predicted_band_gap" in parsed:
+                            gap = parsed["predicted_band_gap"]
+                            label = "预测带隙"
                         else:
-                            st.metric("预测带隙", f"{gap} eV")
+                            gap = None
+
+                        if gap is not None:
+                            if isinstance(gap, list) and len(gap) > 0:
+                                st.metric(label, f"{gap[0]:.4f} eV")
+                            else:
+                                st.metric(label, f"{gap} eV")
+                        else:
+                            st.json(parsed)
                     else:
                         st.json(parsed)
                 except Exception as e:
@@ -1688,7 +1721,7 @@ def ml_prediction_page():
                     st.json(result)
             else:
                 st.info("请输入化学式并点击预测")
-            
+
             st.markdown('</div>', unsafe_allow_html=True)
     
     # ========== 标签页 2: ALIGNN 多性质预测 ==========

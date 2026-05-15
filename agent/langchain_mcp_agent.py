@@ -5,6 +5,7 @@ MatAgent MCP 适配器版本 - 使用 langchain-mcp-adapters 官方库
 
 import os
 import asyncio
+import random
 from typing import List, Dict, Any, Optional, Iterator
 from dotenv import load_dotenv
 
@@ -75,20 +76,35 @@ class MatAgentMCP:
     
     # 模型配置
     MODEL_CONFIGS = {
-        "deepseek-chat": {
+        "deepseek-v4-flash": {
             "api_key_env": "DEEPSEEK_API_KEY",
             "base_url": "https://api.deepseek.com",
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-flash",
+            "temperature": 0.7,
         },
-        "deepseek-reasoner": {
+        "deepseek-v4-pro": {
             "api_key_env": "DEEPSEEK_API_KEY",
             "base_url": "https://api.deepseek.com",
-            "model": "deepseek-reasoner",
+            "model": "deepseek-v4-pro",
+            "temperature": 0.7,
+        },
+        "kimi-k2.6": {
+            "api_key_env": "KIMI_API_KEY",
+            "base_url": "https://api.moonshot.cn/v1",
+            "model": "kimi-k2.6",
+            "temperature": 0.6,
+        },
+        "kimi-k2.5": {
+            "api_key_env": "KIMI_API_KEY",
+            "base_url": "https://api.moonshot.cn/v1",
+            "model": "kimi-k2.5",
+            "temperature": 0.6,
         },
         "glm-5": {
             "api_key_env": "ZAI_API_KEY",
             "base_url": "https://open.bigmodel.cn/api/paas/v4",
             "model": "glm-5",
+            "temperature": 0.7,
         },
     }
     
@@ -96,14 +112,14 @@ class MatAgentMCP:
         self,
         api_key: str = None,
         base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-flash",
         mcp_server_url: str = "http://localhost:8000/sse",
     ):
         self.model = str(model)
         self.mcp_server_url = mcp_server_url
         
         # 获取模型配置
-        config = self.MODEL_CONFIGS.get(self.model, self.MODEL_CONFIGS["deepseek-chat"])
+        config = self.MODEL_CONFIGS.get(self.model, self.MODEL_CONFIGS["deepseek-v4-flash"])
         
         # 获取 API Key
         self.api_key = api_key or os.getenv(config["api_key_env"])
@@ -112,34 +128,38 @@ class MatAgentMCP:
         
         self.base_url = base_url if base_url != "https://api.deepseek.com" else config["base_url"]
         self.model_name = config["model"]
-        
+
+        temperature = config.get("temperature", 0.7)
         self.llm = ChatOpenAI(
             model=self.model_name,
             api_key=str(self.api_key),
             base_url=self.base_url,
-            temperature=0.7,
+            temperature=temperature,
             streaming=True,  # 开启流式模式
+            extra_body={"thinking": {"type": "disabled"}} if ("deepseek" in self.model_name or "kimi" in self.model_name) else None,
         )
-        
+
         self.agent = None
         self.tools: List[BaseTool] = []
         self.mcp_client: Optional[MultiServerMCPClient] = None
     
     def _get_llm_for_model(self, model: str) -> ChatOpenAI:
         """获取指定模型的 LLM 实例"""
-        config = self.MODEL_CONFIGS.get(model, self.MODEL_CONFIGS["deepseek-chat"])
+        config = self.MODEL_CONFIGS.get(model, self.MODEL_CONFIGS["deepseek-v4-flash"])
         
         # 获取 API Key
         api_key = os.getenv(config["api_key_env"])
         if not api_key:
             raise ValueError(f"未设置 {config['api_key_env']} 环境变量")
         
+        temperature = config.get("temperature", 0.7)
         return ChatOpenAI(
             model=config["model"],
             api_key=api_key,
             base_url=config["base_url"],
-            temperature=0.7,
+            temperature=temperature,
             streaming=True,
+            extra_body={"thinking": {"type": "disabled"}} if ("deepseek" in config["model"] or "kimi" in config["model"]) else None,
         )
         
     def _wrap_tool(self, tool: BaseTool) -> BaseTool:
@@ -153,6 +173,8 @@ class MatAgentMCP:
             original_arun = tool._arun if hasattr(tool, '_arun') else None
         
         async def wrapped_coroutine(**kwargs):
+            # 随机延迟避免多个工具同时发起请求
+            await asyncio.sleep(random.uniform(0.2, 0.6))
             # 调用原始工具
             if original_coroutine:
                 result = await original_coroutine(**kwargs)
@@ -454,7 +476,7 @@ class MatAgentMCPSync:
         self,
         api_key: Optional[str] = None,
         base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-flash",
         mcp_server_url: str = "http://localhost:8000/sse",
     ):
         self._async_agent = MatAgentMCP(
@@ -567,7 +589,7 @@ class MatAgentMCPSync:
 
 def create_agent(
     api_key: Optional[str] = None,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
     mcp_server_url: str = "http://localhost:8000/sse",
 ) -> MatAgentMCPSync:
     """创建 MatAgent MCP 同步实例"""

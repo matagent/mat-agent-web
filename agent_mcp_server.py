@@ -281,7 +281,7 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     history: list[Any] | None = None
-    model: str = "deepseek-chat"  # 模型选择: deepseek-chat, deepseek-reasoner, glm-5
+    model: str = "deepseek-v4-flash"  # 模型选择: deepseek-v4-flash, deepseek-v4-pro, kimi-k2.6, kimi-k2.5, glm-5
 
 
 class ChatResponse(BaseModel):
@@ -845,6 +845,16 @@ async def predict_bandgap(formula: str):
     """预测材料带隙"""
     try:
         result = await invoke_mcp_tool_direct("predict_band_gap", {"formula": formula})
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/predict_bandgap_gga_hse")
+async def predict_bandgap_gga_hse(formula: str, gap_gga: float):
+    """GGA→HSE 带隙修正预测"""
+    try:
+        result = await invoke_mcp_tool_direct("predict_band_gap_gga_hse", {"formula": formula, "gap_gga": gap_gga})
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
