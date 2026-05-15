@@ -1856,6 +1856,21 @@ def _get_wyckoff_number(spacegroup: str) -> int | None:
         return None
 
 
+def _lookup_wyckoff_data(db, number: int):
+    """查找 Wyckoff 数据库：先精确匹配，再回退到带后缀的变体（如 227-1）"""
+    num_str = str(number)
+    if num_str in db.data:
+        return db.data[num_str]
+    # 尝试第一个原点选择
+    if f"{num_str}-1" in db.data:
+        return db.data[f"{num_str}-1"]
+    # 尝试任何以该编号开头的键
+    for key in db.data:
+        if key.startswith(num_str + "-"):
+            return db.data[key]
+    return None
+
+
 @mcp.tool()
 async def get_wyckoff_positions(spacegroup: str) -> dict:
     """
@@ -1882,7 +1897,7 @@ async def get_wyckoff_positions(spacegroup: str) -> dict:
         return str(val)
 
     db = wyckoff.WyckoffDatabase()
-    sg_data = db.data.get(str(number))
+    sg_data = _lookup_wyckoff_data(db, number)
     if not sg_data:
         return {"args": {"spacegroup": spacegroup}, "returns": {"error": f"数据库中未找到空间群 {number}"}}
 
