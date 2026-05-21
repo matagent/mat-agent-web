@@ -471,11 +471,20 @@ async def chat_stream(request: ChatRequest):
                 elif event_type == "tool_start" and isinstance(event_data, dict):
                     tool_results.append(event_data)
                 elif event_type == "tool_end" and isinstance(event_data, dict):
-                    # 更新工具结果
+                    # 更新工具结果：优先 tool_call_id，回退 name + result is None
+                    event_tool_call_id = event_data.get("tool_call_id")
+                    matched = None
                     for tr in tool_results:
-                        if tr.get("tool_name") == event_data.get("tool_name") and tr.get("result") is None:
-                            tr["result"] = event_data.get("result")
+                        if event_tool_call_id and tr.get("tool_call_id") == event_tool_call_id:
+                            matched = tr
                             break
+                    if matched is None:
+                        for tr in tool_results:
+                            if tr.get("tool_name") == event_data.get("tool_name") and tr.get("result") is None:
+                                matched = tr
+                                break
+                    if matched:
+                        matched["result"] = event_data.get("result")
                 elif event_type == "complete" and isinstance(event_data, dict):
                     full_message = str(event_data.get("message", full_message))
                     tool_results_from_event = event_data.get("tool_results")
@@ -773,12 +782,12 @@ async def search_materials(
 
 
 @app.get("/materials/structure/{material_id}")
-async def get_material_structure(material_id: str):
+async def get_material_structure(material_id: str, analyze: str = "off"):
     """获取 Material Project 材料结构 (直接调用 MCP 工具)"""
     try:
         result = await invoke_mcp_tool_direct(
             "get_material_structure_from_mp",
-            {"material_id": material_id, "get_plot": True, "get_sites": True}
+            {"material_id": material_id, "get_plot": True, "get_sites": True, "analyze": analyze}
         )
         return {"result": result}
     except Exception as e:
@@ -816,12 +825,103 @@ async def search_materials_oqmd(
 
 
 @app.get("/materials/structure/oqmd/{entry_id}")
-async def get_material_structure_oqmd(entry_id: int):
+async def get_material_structure_oqmd(entry_id: int, analyze: str = "off"):
     """获取 OQMD 材料结构"""
     try:
         result = await invoke_mcp_tool_direct(
             "get_material_structure_from_oqmd",
-            {"entry_id": entry_id, "get_plot": True, "get_sites": True}
+            {"entry_id": entry_id, "get_plot": True, "get_sites": True, "analyze": analyze}
+        )
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/materials/search/aflow")
+async def search_materials_aflow(
+    elements: str | None = None,
+    band_gap_min: float | None = None,
+    band_gap_max: float | None = None,
+    stability_max: float | None = None,
+    num_elements_min: int | None = None,
+    num_elements_max: int | None = None,
+    limit: int = 20
+):
+    """AFLOW 材料搜索"""
+    try:
+        params: dict[str, Any] = {"limit": limit}
+        if elements:
+            params["elements"] = _normalize_elements(elements)
+        if band_gap_min is not None:
+            params["band_gap_min"] = band_gap_min
+        if band_gap_max is not None:
+            params["band_gap_max"] = band_gap_max
+        if stability_max is not None:
+            params["stability_max"] = stability_max
+        if num_elements_min is not None:
+            params["num_elements_min"] = num_elements_min
+        if num_elements_max is not None:
+            params["num_elements_max"] = num_elements_max
+
+        result = await invoke_mcp_tool_direct("search_materials_from_aflow", params)
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/materials/structure/aflow/{auid}")
+async def get_material_structure_aflow(auid: str, aurl: str, analyze: str = "off"):
+    """获取 AFLOW 材料结构"""
+    try:
+        result = await invoke_mcp_tool_direct(
+            "get_material_structure_from_aflow",
+            {"auid": auid, "aurl": aurl, "get_plot": True, "get_sites": True, "analyze": analyze}
+        )
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/materials/search/alexandria")
+async def search_materials_alexandria(
+    elements: str | None = None,
+    band_gap_min: float | None = None,
+    band_gap_max: float | None = None,
+    hull_distance_max: float | None = None,
+    num_elements_min: int | None = None,
+    num_elements_max: int | None = None,
+    limit: int = 20,
+    functional: str = "pbe"
+):
+    """Alexandria 材料搜索 (OPTIMADE 接口)"""
+    try:
+        params: dict[str, Any] = {"limit": limit, "functional": functional}
+        if elements:
+            params["elements"] = _normalize_elements(elements)
+        if band_gap_min is not None:
+            params["band_gap_min"] = band_gap_min
+        if band_gap_max is not None:
+            params["band_gap_max"] = band_gap_max
+        if hull_distance_max is not None:
+            params["hull_distance_max"] = hull_distance_max
+        if num_elements_min is not None:
+            params["num_elements_min"] = num_elements_min
+        if num_elements_max is not None:
+            params["num_elements_max"] = num_elements_max
+
+        result = await invoke_mcp_tool_direct("search_materials_from_alexandria", params)
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/materials/structure/alexandria/{material_id}")
+async def get_material_structure_alexandria(material_id: str, functional: str = "pbe", analyze: str = "off"):
+    """获取 Alexandria 材料结构"""
+    try:
+        result = await invoke_mcp_tool_direct(
+            "get_material_structure_from_alexandria",
+            {"material_id": material_id, "functional": functional, "get_plot": True, "get_sites": True, "analyze": analyze}
         )
         return {"result": result}
     except Exception as e:

@@ -502,9 +502,9 @@ def search_materials(elements: str = None, exclude: str = None, formula: str = N
         params["num_elements_max"] = num_elements_max
     return call_mcp_api("/materials/search", params=params)
 
-def get_material_structure(material_id: str) -> dict:
+def get_material_structure(material_id: str, analyze: str = "off") -> dict:
     """获取材料结构 (Material Project)"""
-    return call_mcp_api(f"/materials/structure/{material_id}")
+    return call_mcp_api(f"/materials/structure/{material_id}", params={"analyze": analyze})
 
 
 def search_materials_oqmd(elements: str = None, band_gap_min: float = None,
@@ -526,9 +526,65 @@ def search_materials_oqmd(elements: str = None, band_gap_min: float = None,
     return call_mcp_api("/materials/search/oqmd", params=params)
 
 
-def get_material_structure_oqmd(entry_id: int) -> dict:
+def get_material_structure_oqmd(entry_id: int, analyze: str = "off") -> dict:
     """获取 OQMD 材料结构"""
-    return call_mcp_api(f"/materials/structure/oqmd/{entry_id}")
+    return call_mcp_api(f"/materials/structure/oqmd/{entry_id}", params={"analyze": analyze})
+
+
+def search_materials_aflow(elements: str = None, band_gap_min: float = None,
+                           band_gap_max: float = None, stability_max: float = None,
+                           num_elements_min: int = None, num_elements_max: int = None,
+                           limit: int = 20) -> dict:
+    """AFLOW 材料搜索"""
+    params = {"limit": limit}
+    if elements:
+        params["elements"] = elements
+    if band_gap_min is not None:
+        params["band_gap_min"] = band_gap_min
+    if band_gap_max is not None:
+        params["band_gap_max"] = band_gap_max
+    if stability_max is not None:
+        params["stability_max"] = stability_max
+    if num_elements_min is not None:
+        params["num_elements_min"] = num_elements_min
+    if num_elements_max is not None:
+        params["num_elements_max"] = num_elements_max
+    return call_mcp_api("/materials/search/aflow", params=params)
+
+
+def get_material_structure_aflow(auid: str, aurl: str, analyze: str = "off") -> dict:
+    """获取 AFLOW 材料结构"""
+    from urllib.parse import quote
+    return call_mcp_api(f"/materials/structure/aflow/{quote(auid, safe='')}", params={"aurl": aurl, "analyze": analyze})
+
+
+def search_materials_alexandria(elements: str = None, band_gap_min: float = None,
+                                band_gap_max: float = None, hull_distance_max: float = None,
+                                num_elements_min: int = None, num_elements_max: int = None,
+                                limit: int = 20, functional: str = "pbe") -> dict:
+    """Alexandria 材料搜索"""
+    params = {"limit": limit, "functional": functional}
+    if elements:
+        params["elements"] = elements
+    if band_gap_min is not None:
+        params["band_gap_min"] = band_gap_min
+    if band_gap_max is not None:
+        params["band_gap_max"] = band_gap_max
+    if hull_distance_max is not None:
+        params["hull_distance_max"] = hull_distance_max
+    if num_elements_min is not None:
+        params["num_elements_min"] = num_elements_min
+    if num_elements_max is not None:
+        params["num_elements_max"] = num_elements_max
+    return call_mcp_api("/materials/search/alexandria", params=params)
+
+
+def get_material_structure_alexandria(material_id: str, functional: str = "pbe", analyze: str = "off") -> dict:
+    """获取 Alexandria 材料结构"""
+    from urllib.parse import quote
+    return call_mcp_api(f"/materials/structure/alexandria/{quote(material_id, safe='')}",
+                        params={"functional": functional, "analyze": analyze})
+
 
 def build_structure(**kwargs) -> dict:
     """构建结构"""
@@ -1025,15 +1081,15 @@ def chat_page():
             
             # 流式接收响应
             last_update_time = time.time()
-            is_tool_running = False  # 标记是否正在执行工具
-            
+            tool_running_count = 0  # 计数器：正在执行的工具数量
+
             for event in chat_with_mcp_stream(prompt, model=st.session_state.selected_model):
                 event_type = event.get("type")
                 data = event.get("data")
-                
+
                 if event_type == "token" and isinstance(data, str):
                     # 如果正在执行工具，不累积 token（这些是工具返回的 JSON，不是回复）
-                    if is_tool_running:
+                    if tool_running_count > 0:
                         continue
                     # 后端发送的是单个 token，需要累积
                     full_message += data
@@ -1046,7 +1102,7 @@ def chat_page():
                     
                 elif event_type == "tool_start" and isinstance(data, dict):
                     # 标记工具开始执行
-                    is_tool_running = True
+                    tool_running_count += 1
                     
                     tool_name = data.get("tool_name", "未知工具")
                     print(f"[FRONTEND DEBUG] tool_start received: {data}")
@@ -1132,8 +1188,8 @@ def chat_page():
                                 item["data"] = tool_data
                                 break
                     
-                    # 重置工具运行标记
-                    is_tool_running = False
+                    # 减少运行中工具计数
+                    tool_running_count = max(0, tool_running_count - 1)
                     
                 elif event_type == "complete" and isinstance(data, dict):
                     # 流结束，使用后端返回的完整消息（已清理工具JSON）
@@ -1276,6 +1332,116 @@ def _display_structure_details(result_data):
                 ])
             st.dataframe(sites_df, use_container_width=True)
 
+    analysis = struct_data.get("analysis") or result_data.get("analysis")
+    if analysis:
+        with st.expander("🔍 结构分析 (Wyckoff位置 / 键长 / 键角)", expanded=True):
+            if "space_group_symbol" in analysis:
+                st.markdown(f"**空间群:** {analysis['space_group_symbol']} (#{analysis.get('space_group_number', '')}), "
+                           f"晶系: {analysis.get('crystal_system', 'N/A')}")
+
+            # Wyckoff positions
+            wyckoff = analysis.get("wyckoff_positions")
+            if wyckoff:
+                st.markdown("**Wyckoff 位置**")
+                import pandas as pd
+                wdf = pd.DataFrame([
+                    {"元素": w["element"], "Wyckoff字母": w["wyckoff_letter"],
+                     "多重度": w["multiplicity"], "位点对称性": w["site_symmetry"],
+                     "分数坐标": f"({w['fractional_coordinates'][0]:.4f}, {w['fractional_coordinates'][1]:.4f}, {w['fractional_coordinates'][2]:.4f})"}
+                    for w in wyckoff
+                ])
+                st.dataframe(wdf, use_container_width=True, hide_index=True)
+
+            # BVS 键价和
+            bvs = analysis.get("bvs")
+            if bvs:
+                st.markdown("**键价和 (BVS)**")
+                import pandas as pd
+                bvs_df = pd.DataFrame([
+                    {"元素": s["element"],
+                     "BVS估算价态": s["bv_sum"] if isinstance(s.get("bv_sum"), (int, float)) else str(s.get("bv_sum", "")),
+                     "预期氧化态": s.get("expected_oxi", "")}
+                    for s in bvs
+                ])
+                st.dataframe(bvs_df, use_container_width=True, hide_index=True)
+
+            # 逐位点 BVS
+            bvs_sites = analysis.get("bvs_sites")
+            if bvs_sites:
+                with st.expander(f"逐位点BVS ({len(bvs_sites)} 个)"):
+                    bsdf = pd.DataFrame([
+                        {"位点": s["site_index"], "元素": s["element"], "BVS价态": s["bvs_valence"]}
+                        for s in bvs_sites
+                    ])
+                    st.dataframe(bsdf, use_container_width=True, hide_index=True)
+
+            # 键长统计摘要 (所有模式)
+            bond_summary = analysis.get("bond_summary")
+            if bond_summary:
+                st.markdown(f"**键长分析** ({analysis.get('bond_count', '?')} 个键)")
+                bsdf = pd.DataFrame([
+                    {"元素对": s["pair"], "数量": s["count"],
+                     "最短 (Å)": s["min"], "最长 (Å)": s["max"], "平均 (Å)": s["mean"]}
+                    for s in bond_summary
+                ])
+                st.dataframe(bsdf, use_container_width=True, hide_index=True)
+
+            # 完整键列表 (仅 full 模式)
+            bonds = analysis.get("bonds")
+            if bonds:
+                with st.expander(f"完整键列表 ({len(bonds)} 条)"):
+                    bdf = pd.DataFrame([
+                        {"键": b["pair"], "距离 (Å)": b["distance"]}
+                        for b in bonds
+                    ])
+                    st.dataframe(bdf, use_container_width=True, hide_index=True)
+
+            # 键角统计摘要 (所有模式)
+            angle_summary = analysis.get("angle_summary")
+            if angle_summary:
+                st.markdown(f"**键角分析** ({analysis.get('angle_count', '?')} 个角)")
+                asdf = pd.DataFrame([
+                    {"三元组": s["triplet"], "数量": s["count"],
+                     "最小 (°)": s["min"], "最大 (°)": s["max"], "平均 (°)": s["mean"]}
+                    for s in angle_summary
+                ])
+                st.dataframe(asdf, use_container_width=True, hide_index=True)
+
+            # 完整角度列表 (仅 full 模式)
+            angles = analysis.get("angles")
+            if angles:
+                with st.expander(f"完整角度列表 ({len(angles)} 条)"):
+                    adf = pd.DataFrame([
+                        {"键角": a["triplet"], "角度 (°)": a["angle_deg"]}
+                        for a in angles
+                    ])
+                    st.dataframe(adf, use_container_width=True, hide_index=True)
+
+            # 配位数统计摘要 (所有模式)
+            cn_summary = analysis.get("coordination_summary")
+            if cn_summary:
+                st.markdown("**配位数**")
+                csdf = pd.DataFrame([
+                    {"元素": elem, "位点数": info["count"],
+                     "最小CN": info["min"], "最大CN": info["max"], "平均CN": info["mean"]}
+                    for elem, info in sorted(cn_summary.items())
+                ])
+                st.dataframe(csdf, use_container_width=True, hide_index=True)
+
+            # 逐位点配位数 (normal/full 模式)
+            coord = analysis.get("coordination")
+            if coord:
+                with st.expander(f"逐位点配位数 ({len(coord)} 个)"):
+                    cdf = pd.DataFrame([
+                        {"位点": k, "元素": v["element"], "配位数": v["coordination_number"]}
+                        for k, v in list(coord.items())[:30]
+                    ])
+                    st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+            for err_key in ["wyckoff_error", "bond_error", "angle_error", "bvs_error"]:
+                if err_key in analysis:
+                    st.warning(f"{err_key}: {analysis[err_key]}")
+
     if "image_url" in result_data and result_data["image_url"]:
         st.divider()
         st.markdown("**📊 结构示意图**")
@@ -1301,8 +1467,11 @@ def material_search_page():
         st.warning("⚠️ MCP 服务未连接")
         return
 
-    db_choice = st.radio("数据库", ["Materials Project", "OQMD"], horizontal=True, key="search_db")
+    db_choice = st.radio("数据库", ["Materials Project", "OQMD", "AFLOW", "Alexandria"], horizontal=True, key="search_db")
     is_mp = db_choice == "Materials Project"
+    is_aflow = db_choice == "AFLOW"
+    is_alex = db_choice == "Alexandria"
+    source = "mp" if is_mp else ("aflow" if is_aflow else ("alexandria" if is_alex else "oqmd"))
 
     st.markdown(f'<p class="subtitle">从 {db_choice} 数据库搜索材料</p>', unsafe_allow_html=True)
 
@@ -1323,8 +1492,18 @@ def material_search_page():
                 band_gap_max = st.number_input("最大带隙 (eV)", value=None, step=0.1, format="%.1f",
                                                key="search_bg_max", help="留空不限制")
 
-            eah_label = "形成能上限 (eV/atom)" if is_mp else "稳定性上限 (eV/atom)"
-            eah_help = "energy_above_hull，0 = 最稳定" if is_mp else "hull distance，0 = 最稳定"
+            if is_mp:
+                eah_label = "形成能上限 (eV/atom)"
+                eah_help = "energy_above_hull，0 = 最稳定"
+            elif is_aflow:
+                eah_label = "生成焓上限 (eV/atom)"
+                eah_help = "enthalpy_formation_atom，越负越稳定"
+            elif is_alex:
+                eah_label = "Hull distance 上限 (eV/atom)"
+                eah_help = "距凸包距离，0 = 在凸包上"
+            else:
+                eah_label = "稳定性上限 (eV/atom)"
+                eah_help = "hull distance，0 = 最稳定"
             energy_above_hull_max = st.number_input(eah_label, value=None, step=0.01, format="%.2f",
                                                     key="search_eah", help=eah_help)
 
@@ -1352,7 +1531,8 @@ def material_search_page():
                 if not elements:
                     st.warning("请输入包含元素")
                 else:
-                    with st.spinner(f"搜索中...{' (OQMD 响应较慢)' if not is_mp else ''}"):
+                    slow_msg = " (数据库响应较慢请耐心等待)" if not is_mp and not is_aflow else ""
+                    with st.spinner(f"搜索中...{slow_msg}"):
                         if is_mp:
                             result = search_materials(
                                 elements=elements,
@@ -1365,6 +1545,26 @@ def material_search_page():
                                 num_elements_min=num_elements_min,
                                 num_elements_max=num_elements_max,
                                 chunk_size=chunk_size
+                            )
+                        elif is_aflow:
+                            result = search_materials_aflow(
+                                elements=elements,
+                                band_gap_min=band_gap_min,
+                                band_gap_max=band_gap_max,
+                                stability_max=energy_above_hull_max,
+                                num_elements_min=num_elements_min,
+                                num_elements_max=num_elements_max,
+                                limit=chunk_size
+                            )
+                        elif is_alex:
+                            result = search_materials_alexandria(
+                                elements=elements,
+                                band_gap_min=band_gap_min,
+                                band_gap_max=band_gap_max,
+                                hull_distance_max=energy_above_hull_max,
+                                num_elements_min=num_elements_min,
+                                num_elements_max=num_elements_max,
+                                limit=chunk_size
                             )
                         else:
                             result = search_materials_oqmd(
@@ -1383,12 +1583,12 @@ def material_search_page():
                             st.session_state.search_results = parse_mcp_result(result)
 
             if st.session_state.get("search_results"):
-                _display_search_results(st.session_state.search_results, is_mp)
+                _display_search_results(st.session_state.search_results, source)
 
             st.markdown('</div>', unsafe_allow_html=True)
 
 
-def _display_search_results(data, is_mp: bool):
+def _display_search_results(data, source: str):
     if isinstance(data, dict) and "error" in data:
         st.error(f"解析失败: {data['error']}")
         return
@@ -1406,13 +1606,21 @@ def _display_search_results(data, is_mp: bool):
         st.info("未找到结果或结果格式不正确")
         return
 
-    for mat in materials:
-        if is_mp:
+    for i, mat in enumerate(materials):
+        if source == "mp":
             mat_id = mat.get('material_id')
             mat_formula = mat.get('formula', 'Unknown')
             spacegroup = mat.get('symmetry', {})
             if isinstance(spacegroup, dict):
                 spacegroup = spacegroup.get('crystal_system', 'N/A')
+        elif source == "aflow":
+            mat_id = mat.get('auid', '')
+            mat_formula = mat.get('compound', 'Unknown')
+            spacegroup = mat.get('spacegroup_relax', 'N/A')
+        elif source == "alexandria":
+            mat_id = mat.get('id', '')
+            mat_formula = mat.get('formula', 'Unknown')
+            spacegroup = mat.get('space_group', 'N/A')
         else:
             mat_id = mat.get('entry_id')
             mat_formula = mat.get('name', 'Unknown')
@@ -1420,26 +1628,58 @@ def _display_search_results(data, is_mp: bool):
 
         with st.expander(f"{mat_formula} ({mat_id})"):
             col_a, col_b = st.columns(2)
-            col_a.metric("带隙", f"{mat.get('band_gap', 'N/A')} eV")
+            col_a.metric("带隙", f"{mat.get('band_gap', mat.get('Egap', 'N/A'))} eV")
 
-            if is_mp:
+            if source == "mp":
                 col_b.metric("晶系", str(spacegroup))
                 eah = mat.get("energy_above_hull")
                 if eah is not None:
                     stable_tag = "✅" if mat.get("is_stable") else ""
                     st.caption(f"形成能: {eah:.4f} eV/atom  {stable_tag}")
+            elif source == "aflow":
+                col_b.metric("空间群", str(spacegroup))
+                hf = mat.get("enthalpy_formation_atom")
+                density = mat.get("density")
+                st.caption(f"生成焓: {hf:.4f} eV/atom" if hf is not None else "生成焓: N/A")
+                if density:
+                    st.caption(f"密度: {density:.2f} g/cm³ | "
+                               f"晶系: {mat.get('lattice_system_relax', 'N/A')} | "
+                               f"元素种类: {mat.get('nspecies', 'N/A')}")
+            elif source == "alexandria":
+                col_b.metric("空间群", str(spacegroup))
+                hd = mat.get("hull_distance")
+                form_e = mat.get("formation_energy_per_atom")
+                st.caption(f"Hull distance: {hd:.4f} eV/atom" if hd is not None else "Hull distance: N/A")
+                if form_e is not None:
+                    st.caption(f"形成能: {form_e:.4f} eV/atom")
+                mag = mat.get("magnetization")
+                if mag is not None:
+                    st.caption(f"磁化强度: {mag:.4f} μB | "
+                               f"元素种类: {mat.get('nelements', 'N/A')} | "
+                               f"原子数: {mat.get('nsites', 'N/A')}")
+                else:
+                    st.caption(f"元素种类: {mat.get('nelements', 'N/A')} | "
+                               f"原子数: {mat.get('nsites', 'N/A')}")
             else:
                 col_b.metric("稳定性", f"{mat.get('stability', 'N/A')}")
                 st.caption(f"形成能: {mat.get('delta_e', 'N/A')} eV/atom | "
                            f"空间群: {spacegroup} | 元素种类: {mat.get('ntypes', 'N/A')}")
 
-            struct_key = f"search_struct_{'mp' if is_mp else 'oqmd'}_{mat_id}"
-            if st.button("📊 查看结构", key=f"view_{'mp' if is_mp else 'oqmd'}_{mat_id}"):
+            struct_source = source if source != "aflow" else "aflow"
+            mat_uid = mat_id if mat_id else f"unknown_{i}"
+            struct_key = f"search_struct_{struct_source}_{mat_uid}"
+            if st.button("📊 查看结构", key=f"view_{struct_source}_{mat_uid}"):
                 with st.spinner("获取结构中..."):
-                    if is_mp:
-                        struct = get_material_structure(mat_id)
+                    if source == "mp":
+                        struct = get_material_structure(mat_id, analyze="normal")
+                    elif source == "aflow":
+                        struct = get_material_structure_aflow(
+                            mat.get('auid', ''), mat.get('aurl', ''), analyze="normal"
+                        )
+                    elif source == "alexandria":
+                        struct = get_material_structure_alexandria(mat_id, analyze="normal")
                     else:
-                        struct = get_material_structure_oqmd(mat_id)
+                        struct = get_material_structure_oqmd(mat_id, analyze="normal")
                     if "error" not in struct:
                         st.session_state[struct_key] = parse_mcp_result(struct)
                         st.rerun()

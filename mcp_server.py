@@ -42,6 +42,8 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pymatgen.io.vasp import Vasprun
 from pymatgen.io.vasp.outputs import Vasprun as VasprunOutput
 from pymatgen.electronic_structure.plotter import BSPlotter
+from pymatgen.analysis.local_env import CrystalNN
+from pymatgen.analysis.bond_valence import BVAnalyzer, BV_PARAMS
 
 from ase.io import write
 from ase import Atoms
@@ -53,6 +55,7 @@ import loadenv
 import databasemanage
 import tryssh
 import oqmd
+import aflow_search
 import flask_server
 
 # ============ 全局配置 ============
@@ -158,6 +161,22 @@ def _get_density_array(dos_obj):
     """从 Dos 对象中提取密度数组"""
     assert hasattr(dos_obj, "densities") and dos_obj.densities, "Dos 对象不包含密度数据"
     return list(dos_obj.densities.values())[0]
+
+
+def _smooth_dos(y, window=7, order=3):
+    """Savitzky-Golay 平滑 DOS 曲线，保留峰形特征"""
+    try:
+        from scipy.signal import savgol_filter
+        if len(y) <= window:
+            return y
+        return savgol_filter(y, window_length=min(window, len(y) - (1 - len(y) % 2)), polyorder=min(order, window - 1))
+    except ImportError:
+        # 回退：简单移动平均
+        window = min(window, len(y))
+        if window <= 2:
+            return y
+        kernel = np.ones(window) / window
+        return np.convolve(y, kernel, mode='same')
 
 
 def _enhance_for_plot(atoms: Atoms, tolerance: float = 0.05) -> Atoms:
@@ -297,22 +316,317 @@ def plot_vasp_band(xml_path, kpoints_path):
         return {"Image": None, "error": str(e)}
 
 
-def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material"):
-    """主接口：解析 VASP 数据并生成 2x3 综合分析图"""
+# ============ 共享工具函数 ============
+
+def _clean_numpy(obj):
+    """递归将 numpy 类型转换为 Python 原生类型，确保 JSON 可序列化。"""
+    import numpy as np
+    if isinstance(obj, dict):
+        return {k: _clean_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_clean_numpy(v) for v in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return _clean_numpy(obj.tolist())
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+
+# ============ 共享结构分析函数 ============
+
+def analyze_structure(structure: Structure, detail: str = "normal") -> dict:
+    """对晶体结构进行综合分析：Wyckoff位置、键长、键角、配位环境。
+
+    所有 get_material_structure_* 和 build_structure 工具共用此函数。
+
+    Args:
+        structure: pymatgen Structure 对象
+        detail: "brief" (仅统计摘要), "normal" (统计+精选列表, 默认), "full" (完整逐条数据)
+    """
+    from collections import defaultdict
+
+    analysis: dict = {"detail": detail}
+
+    # --- Wyckoff 位置分析 ---
+    try:
+        sga = SpacegroupAnalyzer(structure)
+        sym_dataset = sga.get_symmetry_dataset()
+        wyckoff_labels = list(sym_dataset.get("wyckoffs", []))
+        equivalent_atoms = [int(e) for e in sym_dataset.get("equivalent_atoms", [])]
+        sites = structure.sites
+
+        wyckoff_list = []
+        seen_indices = set()
+        for i, site in enumerate(sites):
+            if i in seen_indices:
+                continue
+            equiv_indices = [j for j, eq in enumerate(equivalent_atoms) if eq == equivalent_atoms[i]]
+            seen_indices.update(equiv_indices)
+
+            wyckoff_list.append({
+                "element": str(site.specie.element) if hasattr(site.specie, 'element') else site.species_string,
+                "wyckoff_letter": wyckoff_labels[i] if i < len(wyckoff_labels) else "?",
+                "multiplicity": len(equiv_indices),
+                "site_symmetry": sym_dataset.get("site_symmetry_symbols", [""])[i] if i < len(
+                    sym_dataset.get("site_symmetry_symbols", [])
+                ) else "",
+                "fractional_coordinates": [round(c, 4) for c in site.frac_coords[:3]],
+            })
+
+        analysis["wyckoff_positions"] = wyckoff_list
+        analysis["space_group_symbol"] = sga.get_space_group_symbol()
+        analysis["space_group_number"] = int(sga.get_space_group_number())
+        analysis["crystal_system"] = sga.get_crystal_system()
+    except Exception as e:
+        analysis["wyckoff_error"] = str(e)
+
+    # --- 键长和配位分析 ---
+    try:
+        try:
+            structure.add_oxidation_state_by_guess()
+        except Exception:
+            pass
+
+        cnn = CrystalNN()
+        bond_list = []      # 所有键（含重复方向）
+        all_nn_info = {}
+        for i in range(len(structure)):
+            try:
+                nn_info = cnn.get_nn_info(structure, i)
+            except Exception:
+                nn_info = []
+            all_nn_info[i] = []
+            for neighbor in nn_info:
+                j = neighbor["site_index"]
+                dist = round(float(structure.get_distance(i, j)), 4)
+                bond_list.append({
+                    "pair": f"{str(structure[i].specie.element)}-{str(structure[j].specie.element)}",
+                    "distance": dist,
+                })
+                image = neighbor.get("image", [0, 0, 0])
+                neigh_cart = structure[j].coords + np.dot(image, structure.lattice.matrix)
+                all_nn_info[i].append({
+                    "site_index": j,
+                    "cart_coords": neigh_cart,
+                    "site": structure[j],
+                })
+
+        # 按元素对去重
+        seen_keys = set()
+        deduped = []
+        for b in bond_list:
+            k = b["pair"]
+            if k not in seen_keys:
+                seen_keys.add(k)
+                deduped.append(b)
+        analysis["bond_count"] = len(deduped)
+
+        # 键长统计摘要（按元素对分组）
+        pair_stats = defaultdict(list)
+        for b in bond_list:
+            pair_stats[b["pair"]].append(b["distance"])
+        bond_summary = []
+        for pair, dists in sorted(pair_stats.items()):
+            bond_summary.append({
+                "pair": pair,
+                "count": len(dists),
+                "min": round(min(dists), 4),
+                "max": round(max(dists), 4),
+                "mean": round(sum(dists) / len(dists), 4),
+            })
+        analysis["bond_summary"] = sorted(bond_summary, key=lambda x: x["mean"])
+
+        # 完整键列表：仅 full 模式输出
+        if detail == "full":
+            analysis["bonds"] = [{"pair": b["pair"], "distance": b["distance"]} for b in bond_list]
+
+        # 配位数：先计算每个位点的 CN
+        site_cns = []
+        for i in range(len(structure)):
+            try:
+                cn_val = float(cnn.get_cn(structure, i))
+            except Exception:
+                cn_val = 0.0
+            site_cns.append(cn_val)
+
+        # 按元素统计摘要
+        cn_by_elem = defaultdict(list)
+        for i in range(len(structure)):
+            elem = str(structure[i].specie.element)
+            cn_by_elem[elem].append(site_cns[i])
+        cn_summary = {}
+        for elem, cns in sorted(cn_by_elem.items()):
+            cn_summary[elem] = {
+                "min": round(min(cns), 2), "max": round(max(cns), 2),
+                "mean": round(sum(cns) / len(cns), 2), "count": len(cns),
+            }
+        analysis["coordination_summary"] = cn_summary
+
+        # 逐位点配位数：brief 模式不输出
+        if detail != "brief":
+            analysis["coordination"] = {
+                f"{str(structure[i].specie.element)}_{i}": {
+                    "element": str(structure[i].specie.element),
+                    "site_index": i,
+                    "coordination_number": round(float(site_cns[i]), 2),
+                }
+                for i in range(len(structure))
+            }
+
+    except Exception as e:
+        analysis["bond_error"] = str(e)
+
+    # --- 键角分析 ---
+    try:
+        angle_list = []
+        for i in range(len(structure)):
+            neighbors = all_nn_info.get(i, [])
+            if len(neighbors) < 2:
+                continue
+            vertex_coord = structure[i].coords
+            for a_idx in range(len(neighbors)):
+                for b_idx in range(a_idx + 1, len(neighbors)):
+                    na = neighbors[a_idx]
+                    nb = neighbors[b_idx]
+                    v1 = np.asarray(na["cart_coords"]) - np.asarray(vertex_coord)
+                    v2 = np.asarray(nb["cart_coords"]) - np.asarray(vertex_coord)
+                    norm1 = float(np.linalg.norm(v1))
+                    norm2 = float(np.linalg.norm(v2))
+                    if norm1 < 0.01 or norm2 < 0.01:
+                        continue
+                    cos_angle = float(np.clip(np.dot(v1, v2) / (norm1 * norm2), -1.0, 1.0))
+                    angle_deg = round(float(np.degrees(np.arccos(cos_angle))), 2)
+                    if 10 < angle_deg < 179:
+                        triplet = f"{str(na['site'].specie.element)}-{str(structure[i].specie.element)}-{str(nb['site'].specie.element)}"
+                        angle_list.append({"triplet": triplet, "angle_deg": angle_deg})
+
+        analysis["angle_count"] = len(angle_list)
+
+        # 键角统计摘要（按三元组分组）
+        triplet_stats = defaultdict(list)
+        for a in angle_list:
+            triplet_stats[a["triplet"]].append(a["angle_deg"])
+        angle_summary = []
+        for triplet, angles in sorted(triplet_stats.items()):
+            angle_summary.append({
+                "triplet": triplet,
+                "count": len(angles),
+                "min": min(angles),
+                "max": max(angles),
+                "mean": round(sum(angles) / len(angles), 2),
+            })
+        analysis["angle_summary"] = angle_summary
+
+        # 完整角度列表：仅 full 模式输出（每组 top 8）
+        if detail == "full":
+            grouped = defaultdict(list)
+            for a in angle_list:
+                grouped[a["triplet"]].append(a)
+            flat_angles = []
+            for triplet in sorted(grouped.keys()):
+                items = grouped[triplet]
+                items.sort(key=lambda x: min(abs(x["angle_deg"] - 180), abs(x["angle_deg"] - 109.5)))
+                flat_angles.extend(items[:8])
+            analysis["angles"] = flat_angles
+
+    except Exception as e:
+        analysis["angle_error"] = str(e)
+
+    # --- 键价和 (BVS) 分析 ---
+    try:
+        bva = BVAnalyzer()
+        estimated_valences = bva.get_valences(structure)
+
+        # 按元素统计
+        from collections import defaultdict as _dd
+        bvs_by_elem = _dd(list)
+        for i, site in enumerate(structure):
+            elem = str(site.specie.element)
+            bvs_by_elem[elem].append(estimated_valences[i])
+
+        bvs_summary = []
+        for elem, vals in sorted(bvs_by_elem.items()):
+            bvs_summary.append({
+                "element": elem,
+                "bv_sum": round(sum(vals) / len(vals), 2) if len(vals) == 1 else [round(v, 2) for v in vals],
+                "expected_oxi": round(abs(sum(vals) / len(vals)), 2) if len(vals) == 1 else None,
+            })
+        analysis["bvs"] = bvs_summary
+
+        # 逐位点 BVS (normal/full 模式)
+        if detail != "brief":
+            bvs_sites = []
+            for i, site in enumerate(structure):
+                bvs_sites.append({
+                    "site_index": i,
+                    "element": str(site.specie.element),
+                    "bvs_valence": round(estimated_valences[i], 2) if isinstance(estimated_valences[i], float) else estimated_valences[i],
+                })
+            analysis["bvs_sites"] = bvs_sites
+
+        # full 模式：计算每个键的键价贡献
+        if detail == "full" and "bonds" in analysis:
+            for b in analysis["bonds"]:
+                r = b["distance"]
+                pair = b["pair"].split("-")
+                if len(pair) == 2:
+                    cation_elem = pair[0]
+                    anion_elem = pair[1]
+                    cation_params = BV_PARAMS.get(cation_elem)
+                    anion_params = BV_PARAMS.get(anion_elem)
+                    if cation_params:
+                        R0 = cation_params["r"]
+                        b_const = cation_params.get("c", 0.37)
+                        b["bv_contribution"] = round(float(np.exp((R0 - r) / b_const)), 4)
+                    elif anion_params:
+                        R0 = anion_params["r"]
+                        b_const = anion_params.get("c", 0.37)
+                        b["bv_contribution"] = round(float(np.exp((R0 - r) / b_const)), 4)
+
+    except Exception as e:
+        analysis["bvs_error"] = str(e)
+
+    return _clean_numpy(analysis)
+
+
+def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material", smooth: int = 0):
+    """主接口：解析 VASP 数据并生成 2x3 综合分析图
+
+    Args:
+        vasprun_path: vasprun.xml 路径
+        material_name: 材料名称
+        smooth: Savitzky-Golay 平滑窗口大小，0 或 1 则不平滑 (默认 0)
+    """
     try:
         print(f"正在解析 {vasprun_path}...")
         vr = VasprunOutput(vasprun_path, parse_dos=True)
         complete_dos = vr.complete_dos
-        
+
         assert complete_dos is not None, "无法从 vasprun 提取 CompleteDos"
         assert hasattr(complete_dos, "energies"), "CompleteDos 对象缺失能量数据"
-        
+
         energies = complete_dos.energies - complete_dos.efermi
-        tdos_array = _get_density_array(complete_dos)
+        tdos_raw = _get_density_array(complete_dos)
         element_dos = complete_dos.get_element_dos()
 
-        # DOS数据分析
-        dos_analysis = _analyze_dos_data(energies, tdos_array, element_dos)
+        # DOS数据分析（用原始数据）
+        dos_analysis = _analyze_dos_data(energies, tdos_raw, element_dos)
+
+        # 平滑处理（仅用于绘图）
+        if smooth and smooth > 1:
+            tdos_plot = _smooth_dos(tdos_raw, window=smooth)
+            element_dos_plot = {
+                el: _smooth_dos(_get_density_array(d), window=smooth)
+                for el, d in (element_dos or {}).items()
+            }
+        else:
+            tdos_plot = tdos_raw
+            element_dos_plot = None
 
         # 绘图逻辑 - 2行3列布局
         colors = apply_scientific_style()
@@ -321,8 +635,8 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
 
         # (A) Total DOS
         ax = axes[0, 0]
-        ax.plot(energies, tdos_array, color='black', lw=1.5, label='Total DOS')
-        ax.fill_between(energies, 0, tdos_array, where=(energies < 0), color='gray', alpha=0.2)
+        ax.plot(energies, tdos_plot, color='black', lw=1.5, label='Total DOS')
+        ax.fill_between(energies, 0, tdos_plot, where=(energies < 0), color='gray', alpha=0.2)
         ax.axvline(x=0, color='#D55E00', linestyle='--', lw=1, label='$E_F$')
         
         if 'band_gap' in dos_analysis:
@@ -340,7 +654,8 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
         ax = axes[0, 1]
         if element_dos:
             for i, (el, dos_obj) in enumerate(element_dos.items()):
-                dens = _get_density_array(dos_obj)
+                dens = (element_dos_plot.get(el) if element_dos_plot
+                        else _get_density_array(dos_obj))
                 ax.plot(energies, dens, label=str(el), lw=1.3)
             ax.axvline(x=0, color='#D55E00', linestyle='--', lw=1)
             ax.set_title('(B) Element Projected DOS')
@@ -352,8 +667,8 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
         # (C) Near-Fermi Region (Zoomed)
         ax = axes[0, 2]
         mask = (energies > -4) & (energies < 4)
-        ax.plot(energies[mask], tdos_array[mask], color='black', lw=1.2)
-        ax.fill_between(energies[mask], 0, tdos_array[mask], where=(energies[mask] < 0), color='#56B4E9', alpha=0.3)
+        ax.plot(energies[mask], tdos_plot[mask], color='black', lw=1.2)
+        ax.fill_between(energies[mask], 0, tdos_plot[mask], where=(energies[mask] < 0), color='#56B4E9', alpha=0.3)
         ax.axvline(x=0, color='#D55E00', linestyle='--', lw=1)
         
         if 'dos_at_ef_exact' in dos_analysis:
@@ -371,7 +686,7 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
         ax = axes[1, 0]
         if len(energies) > 1:
             de = energies[1] - energies[0]
-            integrated = np.cumsum(tdos_array) * de
+            integrated = np.cumsum(tdos_plot) * de
             ax.plot(energies, integrated, color='#009E73', lw=1.5)
             
             if 'total_integrated_dos' in dos_analysis:
@@ -430,7 +745,7 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
         
         # (F) DOS峰位分析图
         ax = axes[1, 2]
-        ax.plot(energies, tdos_array, color='black', lw=1.2, alpha=0.7, label='Total DOS')
+        ax.plot(energies, tdos_plot, color='black', lw=1.2, alpha=0.7, label='Total DOS')
         
         if 'major_peaks' in dos_analysis and dos_analysis['major_peaks']:
             peaks = dos_analysis['major_peaks']
@@ -467,7 +782,7 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
                 table.set_fontsize(8)
                 table.scale(1, 1.5)
         else:
-            ax.plot(energies, tdos_array, color='black', lw=1.5)
+            ax.plot(energies, tdos_plot, color='black', lw=1.5)
             ax.text(0.5, 0.5, "No peak analysis available", 
                    ha='center', va='center', transform=ax.transAxes, fontsize=10)
         
@@ -524,7 +839,7 @@ def plot_vasp_dos_analysis(vasprun_path="vasprun.xml", material_name="Material")
         return {"error": str(e)}
 
 
-def _analyze_dos_data(energies, tdos_array, element_dos):
+def _analyze_dos_data(energies, tdos_plot, element_dos):
     """分析DOS数据，返回带隙、费米能级处DOS等关键信息"""
     analysis_results = {}
     
@@ -537,7 +852,7 @@ def _analyze_dos_data(energies, tdos_array, element_dos):
     
     if np.any(valence_mask) and np.any(conduction_mask):
         valence_energies = energies[valence_mask]
-        valence_dos = tdos_array[valence_mask]
+        valence_dos = tdos_plot[valence_mask]
         valence_nonzero = valence_dos > 1e-6
         if np.any(valence_nonzero):
             vbm_index = np.argmax(valence_energies[valence_nonzero])
@@ -547,7 +862,7 @@ def _analyze_dos_data(energies, tdos_array, element_dos):
             analysis_results['vbm_dos'] = float(vbm_dos)
         
         conduction_energies = energies[conduction_mask]
-        conduction_dos = tdos_array[conduction_mask]
+        conduction_dos = tdos_plot[conduction_mask]
         conduction_nonzero = conduction_dos > 1e-6
         if np.any(conduction_nonzero):
             cbm_index = np.argmin(conduction_energies[conduction_nonzero])
@@ -564,26 +879,26 @@ def _analyze_dos_data(energies, tdos_array, element_dos):
     fermi_window = 0.05
     fermi_mask = (energies > -fermi_window) & (energies < fermi_window)
     if np.any(fermi_mask):
-        fermi_dos_values = tdos_array[fermi_mask]
+        fermi_dos_values = tdos_plot[fermi_mask]
         analysis_results['dos_at_fermi'] = float(np.mean(fermi_dos_values))
         analysis_results['fermi_window_avg'] = float(np.mean(fermi_dos_values))
         if len(energies) > 1:
-            dos_at_ef = float(np.interp(0, energies, tdos_array))
+            dos_at_ef = float(np.interp(0, energies, tdos_plot))
             analysis_results['dos_at_ef_exact'] = dos_at_ef
     
     if len(energies) > 1 and 'energy_step' in analysis_results:
         de = analysis_results['energy_step']
-        total_electrons = float(np.sum(tdos_array) * de)
+        total_electrons = float(np.sum(tdos_plot) * de)
         analysis_results['total_integrated_dos'] = total_electrons
     
     if np.any(valence_mask) and 'energy_step' in analysis_results:
         de = analysis_results['energy_step']
-        valence_integral = float(np.sum(tdos_array[valence_mask]) * de)
+        valence_integral = float(np.sum(tdos_plot[valence_mask]) * de)
         analysis_results['valence_integrated_dos'] = valence_integral
     
     if np.any(conduction_mask) and 'energy_step' in analysis_results:
         de = analysis_results['energy_step']
-        conduction_integral = float(np.sum(tdos_array[conduction_mask]) * de)
+        conduction_integral = float(np.sum(tdos_plot[conduction_mask]) * de)
         analysis_results['conduction_integrated_dos'] = conduction_integral
     
     element_contributions = {}
@@ -607,13 +922,13 @@ def _analyze_dos_data(energies, tdos_array, element_dos):
     
     try:
         from scipy.signal import find_peaks
-        peaks, properties = find_peaks(tdos_array, height=0.1, distance=10)
+        peaks, properties = find_peaks(tdos_plot, height=0.1, distance=10)
         if len(peaks) > 0:
             peak_info = []
             for i, peak_idx in enumerate(peaks[:5]):
                 peak_info.append({
                     'energy': float(energies[peak_idx]),
-                    'dos_height': float(tdos_array[peak_idx]),
+                    'dos_height': float(tdos_plot[peak_idx]),
                     'relative_to_fermi': float(energies[peak_idx])
                 })
             analysis_results['major_peaks'] = peak_info
@@ -691,7 +1006,7 @@ def extract_band_info(task_directory: str, plot_band: bool = True) -> dict:
         return {"error": str(e), "message": "提取任务结果失败"}
 
 
-def extract_dos_info(task_directory: str, plot_dos: bool = True) -> dict:
+def extract_dos_info(task_directory: str, plot_dos: bool = True, smooth: int = 0) -> dict:
     """提取态密度计算任务的结果信息"""
     try:
         with connection as vasp_task:
@@ -701,7 +1016,7 @@ def extract_dos_info(task_directory: str, plot_dos: bool = True) -> dict:
                 vasprun_path = local_files.get('vasprun.xml') or local_files.get('vasprun')
 
                 if vasprun_path and os.path.exists(vasprun_path):
-                    res = plot_vasp_dos_analysis(vasprun_path)
+                    res = plot_vasp_dos_analysis(vasprun_path, smooth=smooth)
 
                     image = res.get('Image') if isinstance(res, dict) else None
                     payload = {k: v for k, v in res.items() if k != 'Image'} if isinstance(res, dict) else {}
@@ -739,31 +1054,31 @@ def extract_dos_info(task_directory: str, plot_dos: bool = True) -> dict:
 """
 
 # ----- 基础工具 -----
-@mcp.tool()
-async def get_time() -> dict:
-    """获取当前时间，返回格式：YYYY-MM-DD HH:MM:SS"""
-    args = {}
-    result = {"time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}
-    return {"args": args, "returns": result}
+# @mcp.tool()
+# async def get_time() -> dict:
+#     """获取当前时间，返回格式：YYYY-MM-DD HH:MM:SS"""
+#     args = {}
+#     result = {"time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}
+#     return {"args": args, "returns": result}
 
 
-@mcp.tool()
-async def get_material_project_page(material_id: str) -> dict:
-    """
-    获取指定材料的Material Project页面链接
+# @mcp.tool()
+# async def get_material_project_page(material_id: str) -> dict:
+#     """
+#     获取指定材料的Material Project页面链接
     
-    Args:
-        material_id: 材料ID，如 "mp-1234"
+#     Args:
+#         material_id: 材料ID，如 "mp-1234"
     
-    Returns:
-        dict: 包含 material_id, url, message, error(可选)
-    """
-    args = {"material_id": material_id}
-    if not material_id:
-        return {"args": args, "returns": {"error": "材料ID不能为空", "message": "请提供有效的材料ID"}}
+#     Returns:
+#         dict: 包含 material_id, url, message, error(可选)
+#     """
+#     args = {"material_id": material_id}
+#     if not material_id:
+#         return {"args": args, "returns": {"error": "材料ID不能为空", "message": "请提供有效的材料ID"}}
     
-    url = f"https://next-gen.materialsproject.org/materials/{material_id}/"
-    return {"args": args, "returns": {"url": url}}
+#     url = f"https://next-gen.materialsproject.org/materials/{material_id}/"
+#     return {"args": args, "returns": {"url": url}}
 
 
 @mcp.tool()
@@ -876,23 +1191,25 @@ async def get_material_structure_from_oqmd(
     entry_id: int,
     mode: str = "conventional",
     get_sites: bool = False,
-    get_plot: bool = False, 
-    download: bool = False
+    get_plot: bool = False,
+    download: bool = False,
+    analyze: str = "off"
 ) -> dict | list:
     """
     在OQMD数据库获取指定材料的结构
-    
+
     Args:
         entry_id: OQMD材料条目ID（整数）
         mode: 晶胞类型，"conventional"（常规晶胞，默认）或 "primitive"（原胞）
         get_sites: 是否包含原子位点详细信息，默认 False
         get_plot: 是否生成结构可视化图，默认 False
         download: 是否下载CIF文件，默认 False
-    
+        analyze: 结构分析详细程度 — "off" (不分析), "brief" (仅统计), "normal" (统计+精简列表), "full" (完整列表)
+
     Returns:
         dict | list: 包含 structure_dict, image_url(可选), message, error(可选)
     """
-    args = {"entry_id": entry_id, "mode": mode, "get_sites": get_sites, "get_plot": get_plot, "download": download}
+    args = {"entry_id": entry_id, "mode": mode, "get_sites": get_sites, "get_plot": get_plot, "download": download, "analyze": analyze}
     res = oqmd.parse_poscar_with_pymatgen(entry_id, mode)
     message = []
     if res["success"]:
@@ -919,6 +1236,10 @@ async def get_material_structure_from_oqmd(
             'density': round(structure.density, 4),
             'is_ordered': structure.is_ordered,
         }
+        structure_info = _clean_numpy(structure_info)
+        if analyze != "off":
+            structure_info['analysis'] = analyze_structure(structure, detail=analyze)
+            message.append("结构分析（Wyckoff位置/键长/键角）已包含在返回结果中")
         if get_sites:
             structure_info['sites'] = [{
                 'element': site.species_string,
@@ -928,7 +1249,7 @@ async def get_material_structure_from_oqmd(
         if download:
             CifWriter(structure).write_file(f"cifs/{reduced_formula}-oqmd-{entry_id}.cif")
             print(f"获取材料 {entry_id} 的晶体结构成功，已保存为cif文件")
-            message.append(f"材料 {entry_id} 的晶体结构已保存为cif文件，路径为'cifs/{reduced_formula}-oqmd-{entry_id}.cif'")   
+            message.append(f"材料 {entry_id} 的晶体结构已保存为cif文件，路径为'cifs/{reduced_formula}-oqmd-{entry_id}.cif'")
         if get_plot:
             structure_url = visualize_structure(structure)
             message.append("生成了2d结构预览图和3d可视化交互式网页，请点击查看晶体结构图")
@@ -944,6 +1265,364 @@ async def get_material_structure_from_oqmd(
         return {"args": args, "returns": {"structure_dict": structure_info, "message": message}}
     else:
         return {"args": args, "returns": {"error": res["error"], "message": "构建晶体结构失败"}}
+
+
+# ----- AFLOW 数据库工具 -----
+@mcp.tool()
+async def search_materials_from_aflow(
+    elements: Optional[List[str]] = None,
+    band_gap_min: Optional[float] = None,
+    band_gap_max: Optional[float] = None,
+    stability_max: Optional[float] = None,
+    limit: int = 20,
+    num_elements_min: Optional[int] = None,
+    num_elements_max: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    在AFLOW数据库搜索材料
+
+    Args:
+        elements: 元素列表，如 ["Li", "Fe", "O"] 或 ["Si"]
+        band_gap_min: 最小带隙值（eV）
+        band_gap_max: 最大带隙值（eV）
+        stability_max: 最大生成焓（eV/atom），越负越稳定，默认不限制
+        limit: 返回结果数量限制，默认 20
+        num_elements_min: 最小元素种类数
+        num_elements_max: 最大元素种类数
+
+    Returns:
+        Dict: AFLOW搜索结果
+    """
+    args = {}
+    if elements is not None:
+        args["elements"] = elements
+    if band_gap_min is not None:
+        args["band_gap_min"] = band_gap_min
+    if band_gap_max is not None:
+        args["band_gap_max"] = band_gap_max
+    if stability_max is not None:
+        args["stability_max"] = stability_max
+    if limit != 20:
+        args["limit"] = limit
+    if num_elements_min is not None:
+        args["num_elements_min"] = num_elements_min
+    if num_elements_max is not None:
+        args["num_elements_max"] = num_elements_max
+
+    result = aflow_search.search_aflow(
+        elements=elements,
+        band_gap_min=band_gap_min,
+        band_gap_max=band_gap_max,
+        stability_max=stability_max,
+        num_elements_min=num_elements_min,
+        num_elements_max=num_elements_max,
+        limit=limit,
+    )
+    return {"args": args, "returns": result}
+
+
+@mcp.tool()
+async def get_material_structure_from_aflow(
+    auid: str,
+    aurl: str,
+    get_sites: bool = False,
+    get_plot: bool = False,
+    download: bool = False,
+    analyze: str = "off"
+) -> dict | list:
+    """
+    在AFLOW数据库获取指定材料的结构
+
+    Args:
+        auid: AFLOW唯一标识符，如 "aflow:0fd4cd5b650d72e0"
+        aurl: AFLOW数据路径，如 "aflowlib.duke.edu:AFLOWDATA/ICSD_WEB/ORC/Li1O2_ICSD_180561"
+        get_sites: 是否包含原子位点详细信息，默认 False
+        get_plot: 是否生成结构可视化图，默认 False
+        download: 是否下载CIF文件，默认 False
+        analyze: 结构分析详细程度 — "off" (不分析), "brief" (仅统计), "normal" (统计+精简列表), "full" (完整列表)
+
+    Returns:
+        dict | list: 包含 structure_dict, image_url(可选), message, error(可选)
+    """
+    args = {"auid": auid, "aurl": aurl, "get_sites": get_sites, "get_plot": get_plot, "download": download, "analyze": analyze}
+
+    try:
+        path = aurl.split(":", 1)[1] if ":" in aurl else aurl
+        url = f"https://aflowlib.duke.edu/{path}/CONTCAR.relax"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            return {"args": args, "returns": {"error": f"Failed to fetch structure: HTTP {resp.status_code}"}}
+
+        structure = Structure.from_str(resp.text, fmt="poscar")
+    except Exception as e:
+        return {"args": args, "returns": {"error": f"结构解析失败: {str(e)}", "message": "构建晶体结构失败"}}
+
+    lattice = structure.lattice
+    space_group_info = structure.get_space_group_info()
+    formula = structure.formula
+    reduced_formula = structure.composition.reduced_formula
+    structure_info = {
+        'formula': formula,
+        'reduced_formula': reduced_formula,
+        'space_group_symbol': space_group_info[0] if space_group_info else "未知",
+        'space_group_number': space_group_info[1] if space_group_info else "未知",
+        'lattice_parameters': {
+            'a': round(lattice.a, 4),
+            'b': round(lattice.b, 4),
+            'c': round(lattice.c, 4),
+            'alpha': round(lattice.alpha, 2),
+            'beta': round(lattice.beta, 2),
+            'gamma': round(lattice.gamma, 2),
+            'volume': round(lattice.volume, 4)
+        },
+        'number_of_sites': len(structure),
+        'density': round(structure.density, 4),
+        'is_ordered': structure.is_ordered,
+    }
+    structure_info = _clean_numpy(structure_info)
+
+    message = []
+    if analyze != "off":
+        structure_info['analysis'] = analyze_structure(structure, detail=analyze)
+        message.append("结构分析（Wyckoff位置/键长/键角）已包含在返回结果中")
+    if get_sites:
+        structure_info['sites'] = [{
+            'element': site.species_string,
+            'fractional_coordinates': [round(coord, 4) for coord in site.frac_coords],
+        } for site in structure.sites]
+        message.append(f"材料 {auid} 的原子位点信息已包含在返回结果中")
+
+    if download:
+        CifWriter(structure).write_file(f"cifs/{reduced_formula}-aflow-{auid.replace(':', '_')}.cif")
+        message.append(f"材料 {auid} 的晶体结构已保存为cif文件")
+
+    if get_plot:
+        structure_url = visualize_structure(structure)
+        message.append("生成了2d结构预览图和3d可视化交互式网页，请点击查看晶体结构图")
+        message.append(f"3d_image_url: {structure_url}")
+        res = get_structure_plot(structure)
+        if not res["error"]:
+            image = res["Image"]
+            return {"args": args, "returns": {"image_url": image, "structure_dict": structure_info, "message": message}}
+        else:
+            message.append(res["error"])
+            return {"args": args, "returns": {"structure_dict": structure_info, "message": message}}
+
+    return {"args": args, "returns": {"structure_dict": structure_info, "message": message}}
+
+
+# ----- Alexandria 数据库工具 -----
+@mcp.tool()
+async def search_materials_from_alexandria(
+    elements: Optional[List[str]] = None,
+    band_gap_min: Optional[float] = None,
+    band_gap_max: Optional[float] = None,
+    hull_distance_max: Optional[float] = None,
+    limit: int = 20,
+    num_elements_min: Optional[int] = None,
+    num_elements_max: Optional[int] = None,
+    functional: str = "pbe"
+) -> Dict[str, Any]:
+    """
+    在 Alexandria 材料数据库搜索材料 (OPTIMADE v1.1 接口)
+
+    Args:
+        elements: 元素列表，如 ["Li", "Fe", "O"] 或 ["Si"]
+        band_gap_min: 最小带隙值（eV）
+        band_gap_max: 最大带隙值（eV）
+        hull_distance_max: 最大 hull distance（eV/atom），0 = 在凸包上
+        limit: 返回结果数量限制，默认 20
+        num_elements_min: 最小元素种类数
+        num_elements_max: 最大元素种类数
+        functional: 交换关联泛函 — "pbe" (默认), "pbesol", "scan"
+
+    Returns:
+        Dict: Alexandria 搜索结果，包含 data 和 meta
+    """
+    args = {}
+    if elements is not None:
+        args["elements"] = elements
+    if band_gap_min is not None:
+        args["band_gap_min"] = band_gap_min
+    if band_gap_max is not None:
+        args["band_gap_max"] = band_gap_max
+    if hull_distance_max is not None:
+        args["hull_distance_max"] = hull_distance_max
+    if limit != 20:
+        args["limit"] = limit
+    if num_elements_min is not None:
+        args["num_elements_min"] = num_elements_min
+    if num_elements_max is not None:
+        args["num_elements_max"] = num_elements_max
+    if functional != "pbe":
+        args["functional"] = functional
+
+    filter_parts = []
+    if elements:
+        elem_str = ", ".join(f'"{e}"' for e in elements)
+        filter_parts.append(f"elements HAS ALL {elem_str}")
+    if band_gap_min is not None:
+        filter_parts.append(f"_alexandria_band_gap >= {band_gap_min}")
+    if band_gap_max is not None:
+        filter_parts.append(f"_alexandria_band_gap <= {band_gap_max}")
+    if hull_distance_max is not None:
+        filter_parts.append(f"_alexandria_hull_distance <= {hull_distance_max}")
+    if num_elements_min is not None:
+        filter_parts.append(f"nelements >= {num_elements_min}")
+    if num_elements_max is not None:
+        filter_parts.append(f"nelements <= {num_elements_max}")
+
+    filter_str = " AND ".join(filter_parts) if filter_parts else None
+
+    base_url = f"https://alexandria.icams.rub.de/{functional}/v1/structures"
+    params = {"page_limit": limit}
+    if filter_str:
+        params["filter"] = filter_str
+
+    try:
+        resp = requests.get(base_url, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return {"args": args, "returns": {"error": f"Alexandria 查询失败: {str(e)}"}}
+
+    materials = []
+    for struct in data.get("data", []):
+        attrs = struct.get("attributes", {})
+        mat = {
+            "id": struct.get("id"),
+            "formula": attrs.get("chemical_formula_reduced", "Unknown"),
+            "formula_descriptive": attrs.get("chemical_formula_descriptive", ""),
+            "elements": attrs.get("elements", []),
+            "nelements": attrs.get("nelements", 0),
+            "nsites": attrs.get("nsites", 0),
+            "band_gap": attrs.get("_alexandria_band_gap"),
+            "band_gap_direct": attrs.get("_alexandria_band_gap_direct"),
+            "formation_energy_per_atom": attrs.get("_alexandria_formation_energy_per_atom"),
+            "energy": attrs.get("_alexandria_energy"),
+            "energy_corrected": attrs.get("_alexandria_energy_corrected"),
+            "hull_distance": attrs.get("_alexandria_hull_distance"),
+            "phase_separation_energy": attrs.get("_alexandria_phase_separation_energy"),
+            "magnetization": attrs.get("_alexandria_magnetization"),
+            "dos_ef": attrs.get("_alexandria_dos_ef"),
+            "space_group": attrs.get("_alexandria_space_group"),
+            "xc_functional": attrs.get("_alexandria_xc_functional"),
+            "decomposition": attrs.get("_alexandria_decomposition"),
+        }
+        mat = _clean_numpy(mat)
+        materials.append(mat)
+
+    return {
+        "args": args,
+        "returns": {
+            "data": materials,
+            "meta": {"data_available": data.get("meta", {}).get("data_available", len(materials))}
+        }
+    }
+
+
+@mcp.tool()
+async def get_material_structure_from_alexandria(
+    material_id: str,
+    functional: str = "pbe",
+    get_sites: bool = False,
+    get_plot: bool = False,
+    analyze: str = "off"
+) -> dict:
+    """
+    在 Alexandria 数据库获取指定材料的结构
+
+    Args:
+        material_id: Alexandria 材料ID，如 "agm010193661"
+        functional: 交换关联泛函 — "pbe" (默认), "pbesol", "scan"
+        get_sites: 是否包含原子位点详细信息，默认 False
+        get_plot: 是否生成结构可视化图，默认 False
+        analyze: 结构分析详细程度 — "off" (不分析), "brief" (仅统计), "normal" (统计+精简列表), "full" (完整列表)
+
+    Returns:
+        dict: 包含 structure_dict, image_url(可选), message, error(可选)
+    """
+    args = {"material_id": material_id, "functional": functional, "get_sites": get_sites, "get_plot": get_plot, "analyze": analyze}
+
+    base_url = f"https://alexandria.icams.rub.de/{functional}/v1/structures"
+    params = {"filter": f'id="{material_id}"'}
+
+    try:
+        resp = requests.get(base_url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return {"args": args, "returns": {"error": f"Alexandria 结构获取失败: {str(e)}"}}
+
+    structures = data.get("data", [])
+    if not structures:
+        return {"args": args, "returns": {"error": f"未找到材料: {material_id}"}}
+
+    attrs = structures[0].get("attributes", {})
+    lattice_vectors = attrs.get("lattice_vectors")
+    cartesian_sites = attrs.get("cartesian_site_positions")
+    species_at_sites = attrs.get("species_at_sites")
+
+    if not lattice_vectors or not cartesian_sites or not species_at_sites:
+        return {"args": args, "returns": {"error": "结构数据不完整"}}
+
+    try:
+        structure = Structure(
+            lattice=lattice_vectors,
+            species=species_at_sites,
+            coords=cartesian_sites,
+            coords_are_cartesian=True
+        )
+    except Exception as e:
+        return {"args": args, "returns": {"error": f"结构解析失败: {str(e)}"}}
+
+    formula = structure.formula
+    reduced_formula = structure.composition.reduced_formula
+    space_group_info = structure.get_space_group_info()
+    structure_info = {
+        'formula': formula,
+        'reduced_formula': reduced_formula,
+        'space_group_symbol': space_group_info[0] if space_group_info else "未知",
+        'space_group_number': space_group_info[1] if space_group_info else "未知",
+        'lattice_parameters': {
+            'a': round(structure.lattice.a, 4),
+            'b': round(structure.lattice.b, 4),
+            'c': round(structure.lattice.c, 4),
+            'alpha': round(structure.lattice.alpha, 2),
+            'beta': round(structure.lattice.beta, 2),
+            'gamma': round(structure.lattice.gamma, 2),
+            'volume': round(structure.lattice.volume, 4)
+        },
+        'number_of_sites': len(structure),
+        'density': round(structure.density, 4),
+        'is_ordered': structure.is_ordered,
+    }
+    structure_info = _clean_numpy(structure_info)
+
+    message = []
+    if analyze != "off":
+        structure_info['analysis'] = analyze_structure(structure, detail=analyze)
+        message.append("结构分析（Wyckoff位置/键长/键角）已包含在返回结果中")
+    if get_sites:
+        structure_info['sites'] = [{
+            'element': site.species_string,
+            'fractional_coordinates': [round(coord, 4) for coord in site.frac_coords],
+        } for site in structure.sites]
+        message.append(f"材料 {material_id} 的原子位点信息已包含在返回结果中")
+
+    if get_plot:
+        structure_url = visualize_structure(structure)
+        message.append("生成了2d结构预览图和3d可视化交互式网页，请点击查看晶体结构图")
+        message.append(f"3d_image_url: {structure_url}")
+        res = get_structure_plot(structure)
+        if not res["error"]:
+            image = res["Image"]
+            return {"args": args, "returns": {"image_url": image, "structure_dict": structure_info, "message": message}}
+        else:
+            message.append(res["error"])
+            return {"args": args, "returns": {"structure_dict": structure_info, "message": message}}
+
+    return {"args": args, "returns": {"structure_dict": structure_info, "message": message}}
 
 
 # ----- Material Project 工具 -----
@@ -1082,24 +1761,26 @@ async def get_band_gap(material_id: str) -> dict:
 
 @mcp.tool()
 async def get_material_structure_from_mp(
-    material_id: str, 
+    material_id: str,
     get_sites: bool = False,
-    get_plot: bool = False, 
-    download: bool = False
+    get_plot: bool = False,
+    download: bool = False,
+    analyze: str = "off"
 ) -> dict | list:
     """
     在Material Project上获取指定材料的晶体结构数据
-    
+
     Args:
         material_id: 材料ID，如 "mp-1234"
         get_sites: 是否包含原子位点详细信息，默认 False
         get_plot: 是否生成结构可视化图，默认 False
         download: 是否下载CIF文件，默认 False
+        analyze: 结构分析详细程度 — "off" (不分析), "brief" (仅统计), "normal" (统计+精简列表), "full" (完整列表)
     
     Returns:
         dict | list: 包含 structure_dict, image_url(可选), message, error(可选)
     """
-    args = {"material_id": material_id, "get_sites": get_sites, "get_plot": get_plot, "download": download}
+    args = {"material_id": material_id, "get_sites": get_sites, "get_plot": get_plot, "download": download, "analyze": analyze}
     API_KEY = MY_API_KEY
     if not API_KEY:
         raise ValueError("MP_API_KEY环境变量未设置")
@@ -1131,6 +1812,10 @@ async def get_material_structure_from_mp(
                 'density': round(structure.density, 4),
                 'is_ordered': structure.is_ordered,
             }
+            structure_info = _clean_numpy(structure_info)
+            if analyze != "off":
+                structure_info['analysis'] = analyze_structure(structure, detail=analyze)
+                message.append("结构分析（Wyckoff位置/键长/键角）已包含在返回结果中")
             message.append(f"材料 {material_id} 的晶体结构信息: formula={formula}, space_group={space_group_info[0] if space_group_info else '未知'}")
             if get_sites:
                 sites_data = [{
@@ -1203,10 +1888,11 @@ async def build_structure(
     scaling_matrix: int | list = 1,
     save_to_cif: bool = False,
     add_to_database: str = None,
+    analyze: str = "off",
 ) -> dict | list:
     """
     构建晶体结构并保存为CIF文件，生成晶体结构图
-    
+
     Args:
         a: 晶格参数a（Å）
         b: 晶格参数b（Å）
@@ -1220,11 +1906,12 @@ async def build_structure(
                     列表（list）：长度为 3 的列表，分别表示 a, b, c 方向的扩胞倍数。例如 scaling_matrix=[2, 1, 1]表示构建 2×1×1 的超胞。
         save_to_cif: 是否保存为CIF文件，默认False
         add_to_database: 数据库文件名，如添加则保存到该数据库
-    
+        analyze: 结构分析详细程度 — "off" (不分析), "brief" (仅统计), "normal" (统计+精简列表), "full" (完整列表)
+
     Returns:
-        dict | list: 包含 image, 3d_image_url, message, error(可选)
+        dict | list: 包含 image, 3d_image_url, message, analysis(可选), error(可选)
     """
-    args = {"a": a, "b": b, "c": c, "alpha": alpha, "beta": beta, "gamma": gamma, "elements": elements, "frac_coord": frac_coord, "scaling_matrix": scaling_matrix, "save_to_cif": save_to_cif}
+    args = {"a": a, "b": b, "c": c, "alpha": alpha, "beta": beta, "gamma": gamma, "elements": elements, "frac_coord": frac_coord, "scaling_matrix": scaling_matrix, "save_to_cif": save_to_cif, "analyze": analyze}
     if add_to_database is not None:
         args["add_to_database"] = add_to_database
     
@@ -1243,6 +1930,11 @@ async def build_structure(
         structure_url = visualize_structure(structure)
         message.append("3d晶体结构可视化交互式网页，请点击查看晶体结构图")
 
+        analysis_data = None
+        if analyze != "off":
+            analysis_data = analyze_structure(structure, detail=analyze)
+            message.append("结构分析（Wyckoff位置/键长/键角）已包含在返回结果中")
+
         if add_to_database:
             db = databasemanage.DatabaseManager(add_to_database)
             db.add_material(formula=formula, structure=structure, band_gap=None, material_id=None)
@@ -1252,16 +1944,16 @@ async def build_structure(
         res = get_structure_plot(structure)
         if not res["error"]:
             image = res["Image"]
-            return {
-                "args": args,
-                "returns": {"image": image, "3d_image_url": structure_url, "message": message}
-            }
+            returns = {"image": image, "3d_image_url": structure_url, "message": message}
+            if analysis_data:
+                returns["analysis"] = analysis_data
+            return {"args": args, "returns": returns}
         else:
             message.append(res["error"])
-            return {
-                "args": args,
-                "returns": {"3d_image_url": structure_url, "message": message}
-            }
+            returns = {"3d_image_url": structure_url, "message": message}
+            if analysis_data:
+                returns["analysis"] = analysis_data
+            return {"args": args, "returns": returns}
 
     except Exception as e:
         return {"args": args, "returns": {"error": str(e), "message": "构建晶体结构失败"}}
@@ -1554,25 +2246,26 @@ async def modify_incar(task_directory: str, mission: str, read: bool, write: str
 
 
 @mcp.tool()
-def extract_result(task_directory: str, mission: str, plot: bool = True) -> dict:
+def extract_result(task_directory: str, mission: str, plot: bool = True, smooth: int = 0) -> dict:
     """
     提取计算任务的结果
-    
+
     Args:
         task_directory: 任务目录路径
         mission: 计算类型，可选: "relax"（结构优化）、"scf"（自洽计算）、"band"（能带计算）、"dos"（态密度计算）
         plot: 是否生成图表，默认True
-    
+        smooth: DOS 曲线 Savitzky-Golay 平滑窗口大小，0 则不平滑 (仅对 mission="dos" 有效)
+
     Returns:
         dict: 包含 success, mission, task_directory, result, error(可选)
     """
-    args = {"task_directory": task_directory, "mission": mission, "plot": plot}
+    args = {"task_directory": task_directory, "mission": mission, "plot": plot, "smooth": smooth}
     mission = mission.lower().strip()
     method_map = {
         "relax": lambda: extract_relax_info(task_directory, get_plot=plot, visualize=plot),
         "scf": lambda: extract_scf_info(task_directory),
         "band": lambda: extract_band_info(task_directory, plot_band=plot),
-        "dos": lambda: extract_dos_info(task_directory, plot_dos=plot),
+        "dos": lambda: extract_dos_info(task_directory, plot_dos=plot, smooth=smooth),
     }
 
     if mission not in method_map:
