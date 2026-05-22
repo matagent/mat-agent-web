@@ -6,6 +6,7 @@ MatAgent MCP 适配器版本 - 使用 langchain-mcp-adapters 官方库
 import os
 import asyncio
 import random
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Iterator
 from dotenv import load_dotenv
 
@@ -45,28 +46,34 @@ class ReasoningCallbackHandler(BaseCallbackHandler):
 
 # 系统提示词 - 定义Agent的角色和行为
 # 优先从环境变量读取，否则使用默认提示词
-DEFAULT_SYSTEM_PROMPT = """你是 MatAgent，一位专业的材料科学AI助手。
+DEFAULT_SYSTEM_PROMPT = f"""你是 MatAgent，一位专业的材料科学AI助手。
+当前时间：{datetime.now().strftime('%Y年%m月%d日 %H:%M')}
 
-你的专长包括：
-1. 材料数据库查询（Materials Project(稳定)、OQMD(连接不太稳定)等）
-2. 晶体结构分析与可视化
-3. 材料性质预测（带隙、能带结构等）
-4. VASP计算任务管理
+## 能力范围
+- 材料搜索：Materials Project（推荐，最稳定）、OQMD、AFLOW、Alexandria
+- 晶体结构：获取结构数据、Wyckoff 位置分析、键长/键角/配位分析、2D/3D 可视化
+- 性质预测：带隙预测（XGBoost / GGA→HSE 修正）、ALIGNN 多性质预测
+- 结构建模：自定义晶格参数构建晶体结构
+- VASP 任务：创建任务、生成输入文件、提交/监控计算、提取结果
 
-回复风格：
-- 专业、准确、简洁
-- 使用中文回复用户
-- 对于技术问题，提供清晰的解释
-- 如果不确定，坦诚说明
+## 核心规则（必须严格遵守）
+1. **一次一个工具**：每轮对话只能调用一个工具，等待返回结果后再决定下一步。严禁在一次回复中发起多个工具调用。
+2. **搜索必须带条件**：search_materials_from_* 类工具必须提供筛选条件（elements、chemsys、formula、band_gap 等），不允许空参数查询。
+3. **先搜索再获取**：获取结构/详情前，必须先通过搜索拿到 material_id 或 entry_id。
+4. **失败即停止**：如果工具返回 error 或空结果，直接告知用户并询问更具体的条件，不要反复重试同一工具。
 
-当使用工具时：
-- 理解用户需求后选择合适的工具
-- 解释工具返回的结果（用自己的话总结，不要重复原始JSON数据）
-- 返回结果里有图片url的话请用markdown格式渲染图片
-- 如有必要，建议下一步操作
+## 典型工作流
+- 搜索材料 → 展示结果列表 → 用户选择 → 获取结构+可视化
+- 搜索材料 → 展示结果 → 预测带隙/性质
+- 用户提供化学式 → 直接预测带隙
+- 用户提供晶格参数 → 构建结构+可视化
 
-重要：不要在回复中包含工具返回的原始JSON文本或结构化数据。只提供对结果的简洁解释和解读。
-"""
+## 回复要求
+- 使用中文，专业简洁
+- 用自己的话解读工具结果，禁止输出原始 JSON
+- 结果中含图片 URL 时用 Markdown 渲染：![图片](url)
+- 展示材料列表时用表格，包含 formula、material_id、band_gap、energy_above_hull 等关键字段
+- 不确定时坦诚说明，不要编造数据"""
 
 SYSTEM_PROMPT = os.getenv("MATAGENT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
@@ -211,6 +218,7 @@ class MatAgentMCP:
             "matagent": {
                 "transport": "sse",
                 "url": self.mcp_server_url,
+                "sse_read_timeout": None,  # Disable read timeout for long-lived SSE connection
             }
         }
         
@@ -253,20 +261,20 @@ class MatAgentMCP:
         if not self.agent:
             raise RuntimeError("Agent 未初始化，请先调用 connect()")
         
-        config = {"configurable": {"thread_id": thread_id or "default"}}
-        
+        config = {"configurable": {"thread_id": thread_id or "default"}, "recursion_limit": 15}
+
         # 构建消息列表：系统提示词 + 用户消息
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=message)
         ]
-        
+
         # 如果指定了不同模型，用该模型创建临时 agent
         if model and model != self.model:
             agent = self._create_agent_with_llm(self._get_llm_for_model(model))
         else:
             agent = self.agent
-        
+
         response = await agent.ainvoke(
             {"messages": messages},
             config=config
@@ -287,18 +295,29 @@ class MatAgentMCP:
             # 检查是否有工具调用
             if hasattr(msg, 'tool_calls') and msg.tool_calls:
                 for tc in msg.tool_calls:
+                    tool_call_id = tc.get("id")
                     tool_results.append({
                         "tool_name": tc.get("name", "unknown"),
                         "tool_args": tc.get("args", {}),
+                        "tool_call_id": tool_call_id,
                         "result": None  # 将在后续消息中填充
                     })
             # 检查工具返回结果
             if hasattr(msg, 'name') and msg.name:
-                # 找到对应的工具调用并填充结果
+                result_tool_call_id = getattr(msg, 'tool_call_id', None)
+                # 优先通过 tool_call_id 精确匹配，回退到 name + result is None
+                matched = None
                 for tr in tool_results:
-                    if tr["tool_name"] == msg.name and tr["result"] is None:
-                        tr["result"] = msg.content
+                    if result_tool_call_id and tr.get("tool_call_id") == result_tool_call_id:
+                        matched = tr
                         break
+                if matched is None:
+                    for tr in tool_results:
+                        if tr["tool_name"] == msg.name and tr["result"] is None:
+                            matched = tr
+                            break
+                if matched:
+                    matched["result"] = msg.content
         
         return {
             "message": ai_content if ai_content else "无响应",
@@ -320,18 +339,17 @@ class MatAgentMCP:
         if not self.agent:
             raise RuntimeError("Agent 未初始化，请先调用 connect()")
 
-        config = {"configurable": {"thread_id": thread_id or "default"}}
+        config = {"configurable": {"thread_id": thread_id or "default"}, "recursion_limit": 15}
 
         # 构建消息列表：系统提示词 + 用户消息
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=message)
         ]
-        
+
         tool_results: list[dict[str, Any]] = []
         full_message = ""
-        pending_tool_calls: dict[str, dict[str, Any]] = {}  # 跟踪待完成的工具调用
-        sent_tool_ids: set[str] = set()  # 跟踪已发送的 tool_start 事件
+        _fallback_counter = 0  # 用于生成唯一的 fallback tool_id
 
         # 如果指定了不同模型，用该模型创建临时 agent
         if model and model != self.model:
@@ -359,9 +377,24 @@ class MatAgentMCP:
                     for tc in msg.tool_calls:
                         # 支持多种可能的字段名
                         tool_name = tc.get("name") or tc.get("function", {}).get("name") or "unknown"
-                        tool_args = tc.get("args") or tc.get("function", {}).get("arguments") or {}
                         tool_call_id = tc.get("id")
-                        
+
+                        # 提取参数：支持多种格式
+                        tool_args = tc.get("args")
+                        if not tool_args:
+                            # Legacy 格式：function.arguments 可能是 JSON 字符串
+                            args_raw = tc.get("function", {}).get("arguments")
+                            if isinstance(args_raw, str) and args_raw.strip():
+                                try:
+                                    import json as _json
+                                    tool_args = _json.loads(args_raw)
+                                except Exception:
+                                    tool_args = {}
+                            elif isinstance(args_raw, dict):
+                                tool_args = args_raw
+                            else:
+                                tool_args = {}
+
                         # 调试输出 - 详细检查 tc 的所有字段
                         print(f"[DEBUG] Tool call detected: name={tool_name}")
                         print(f"[DEBUG] tc type={type(tc)}, tc={tc}")
@@ -372,40 +405,45 @@ class MatAgentMCP:
                         if not tool_call_id and tool_name == "unknown":
                             continue
                         
-                        # 生成唯一标识：优先使用工具返回的 id，否则用 name+args 哈希
+                        # 生成唯一标识：优先使用 LangChain 的 tool_call_id（每次调用唯一）
                         if tool_call_id:
                             tool_id = tool_call_id
                         else:
                             import hashlib
+                            _fallback_counter += 1
                             args_str = str(tool_args)
-                            tool_id = f"{tool_name}_{hashlib.md5(args_str.encode()).hexdigest()[:8]}"
-
-                        # 避免重复发送同一个工具调用
-                        if tool_id in sent_tool_ids:
-                            continue
-                        sent_tool_ids.add(tool_id)
+                            tool_id = f"{tool_name}_{hashlib.md5(args_str.encode()).hexdigest()[:8]}_{_fallback_counter}"
 
                         tool_info: dict[str, Any] = {
                             "tool_name": tool_name,
                             "tool_args": tool_args,
                             "tool_id": tool_id,
+                            "tool_call_id": tool_call_id,
                             "result": None
                         }
                         tool_results.append(tool_info)
-                        pending_tool_calls[tool_id] = tool_info
                         yield {"type": "tool_start", "data": tool_info}
 
             # 处理工具返回结果
             elif hasattr(msg, 'name') and msg.name:
                 tool_name = msg.name
                 tool_content = msg.content if hasattr(msg, 'content') else None
+                result_tool_call_id = getattr(msg, 'tool_call_id', None)
 
-                # 找到对应的工具调用并更新
+                # 优先通过 tool_call_id 精确匹配，回退到 name + result is None
+                matched = None
                 for tr in tool_results:
-                    if tr.get("tool_name") == tool_name and tr.get("result") is None:
-                        tr["result"] = tool_content
-                        yield {"type": "tool_end", "data": tr}
+                    if result_tool_call_id and tr.get("tool_call_id") == result_tool_call_id:
+                        matched = tr
                         break
+                if matched is None:
+                    for tr in tool_results:
+                        if tr.get("tool_name") == tool_name and tr.get("result") is None:
+                            matched = tr
+                            break
+                if matched:
+                    matched["result"] = tool_content
+                    yield {"type": "tool_end", "data": matched}
 
         # 清理消息中的工具JSON内容
         cleaned_message = self._clean_tool_json_from_message(full_message)

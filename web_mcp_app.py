@@ -950,6 +950,69 @@ def display_tool_result(tr: dict):
             st.code(str(result))
 
 
+def _reconcile_tools(tool_results: list, content_placeholders: list):
+    """用后端返回的权威 tool_results 更新所有未完成的工具框。
+
+    当 complete/done 事件到达时调用，确保即使某些 tool_end 事件
+    在传输中丢失或未匹配，前端工具框也能正确更新。
+    """
+    if not tool_results:
+        return
+
+    # 构建后端结果索引: tool_call_id -> result, tool_name -> [results]
+    by_call_id: dict[str, dict] = {}
+    by_name: list[dict] = []
+    for tr in tool_results:
+        cid = tr.get("tool_call_id")
+        if cid:
+            by_call_id[cid] = tr
+        by_name.append(tr)
+
+    for item in content_placeholders:
+        if item.get("type") != "tool" or item.get("status") != "running":
+            continue
+
+        item_tool_call_id = item.get("data", {}).get("tool_call_id")
+        item_tool_name = item.get("data", {}).get("tool_name")
+
+        # 优先通过 tool_call_id 精确匹配
+        result_tr = None
+        if item_tool_call_id and item_tool_call_id in by_call_id:
+            result_tr = by_call_id.pop(item_tool_call_id)
+
+        # 回退：按名称匹配第一个未使用的
+        if result_tr is None:
+            for i, tr in enumerate(by_name):
+                if tr.get("tool_name") == item_tool_name and tr.get("result") is not None:
+                    result_tr = tr
+                    by_name.pop(i)
+                    break
+
+        if result_tr is not None:
+            tool_placeholder = item["placeholder"]
+            tool_data = item["data"].copy()
+            tool_data["result"] = result_tr.get("result")
+
+            tool_placeholder.empty()
+            with tool_placeholder.container():
+                display_tool_result(tool_data)
+
+            item["status"] = "completed"
+            item["data"] = tool_data
+        else:
+            # 后端也没有结果，标记为未完成
+            tool_placeholder = item["placeholder"]
+            tool_data = item["data"].copy()
+            tool_data["result"] = "⚠️ 工具未完成（响应中断或超时）"
+
+            tool_placeholder.empty()
+            with tool_placeholder.container():
+                display_tool_result(tool_data)
+
+            item["status"] = "completed"
+            item["data"] = tool_data
+
+
 def chat_page():
     # 只显示副标题（Logo 只在侧边栏显示）
     st.markdown('<h1 class="main-title">💬 MatAgent材料智能设计平台</h1>', unsafe_allow_html=True)
@@ -1195,10 +1258,13 @@ def chat_page():
                     # 流结束，使用后端返回的完整消息（已清理工具JSON）
                     full_message = data.get("message", full_message)
                     duration = data.get("duration", 0)
-                    
+                    # 用后端提供的权威 tool_results 更新所有未完成的工具框
+                    _reconcile_tools(data.get("tool_results", []), content_placeholders)
+
                 elif event_type == "done" and isinstance(data, dict):
                     # 兼容旧格式的流结束事件
                     duration = data.get("duration", 0)
+                    _reconcile_tools(data.get("tool_results", []), content_placeholders)
                     
                 elif event_type == "error":
                     # 错误
@@ -1206,7 +1272,10 @@ def chat_page():
                     full_message += f"\n\n❌ 错误: {error_msg}"
                     current_text += f"\n\n❌ 错误: {error_msg}"
                     break
-            
+
+            # 清理所有仍在运行的工具框（兜底：stream 异常退出时没有 complete/done 事件）
+            _reconcile_tools([], content_placeholders)
+
             # 保存最后的文本
             if current_text:
                 current_text_placeholder.markdown(current_text)

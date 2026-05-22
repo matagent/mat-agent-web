@@ -1678,6 +1678,17 @@ async def search_materials_from_mp(
     API_KEY = MY_API_KEY
     if not API_KEY:
         raise ValueError("API密钥未设置")
+
+    # 检查是否提供了任何筛选条件
+    has_filter = any([
+        elements, exclude_elements, chemsys, band_gap, num_elements,
+        formula, energy_above_hull_min is not None, energy_above_hull_max is not None,
+    ])
+    if not has_filter:
+        return {"args": args, "returns": {
+            "error": "未提供任何筛选条件，搜索范围过大。请提供至少一个筛选条件：elements（元素列表，如 ['Li', 'Fe', 'O']）、chemsys（化学系统，如 'Li-Fe-O'）、formula（化学式，如 'LiFeO2'）、band_gap（带隙范围，如 (0, 3)）或 num_elements（元素数量范围，如 (2, 4)）"
+        }}
+
     try:
         with MPRester(API_KEY) as mpr:
             search_kwargs = {}
