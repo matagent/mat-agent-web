@@ -337,6 +337,14 @@ def _clean_numpy(obj):
         return obj
 
 
+# ============ 计算服务器连接检查 ============
+
+def _check_connection() -> dict | None:
+    """检查计算服务器连接状态，未连接时返回错误信息字典"""
+    if connection is None:
+        return {"error": "计算服务器未连接", "message": "SSH 连接失败，VASP/计算相关工具当前不可用。材料搜索、结构查询、带隙预测等其他工具不受影响"}
+
+
 # ============ 共享结构分析函数 ============
 
 def analyze_structure(structure: Structure, detail: str = "normal") -> dict:
@@ -1984,6 +1992,9 @@ async def create_task(formula: str, cif_path: str) -> dict:
         dict: 包含 message, task_directory, error(可选)
     """
     args = {"formula": formula, "cif_path": cif_path}
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
     try:
         with connection as vasp_task:
             base_dir = config.get_base_dir()
@@ -2008,6 +2019,9 @@ async def list_task_directories() -> dict:
     列出远程服务器上的所有任务目录
     """
     args = {}
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
     try:
         with connection as vasp_task:
             base_dir = config.get_base_dir()
@@ -2032,6 +2046,9 @@ async def check_squeue() -> dict:
     检查远程服务器上的任务队列
     """
     args = {}
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
     try:
         with connection as vasp_task:
             result = None
@@ -2059,6 +2076,9 @@ async def execute_command(command: str) -> dict:
         dict: 命令执行结果或错误信息
     """
     args = {"command": command}
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
     try:
         with connection as vasp_task:
             result = vasp_task.execute_command(command)
@@ -2083,6 +2103,9 @@ async def extract_file(file_path: str) -> dict:
             - message: 操作结果消息
     """
     args = {"file_path": file_path}
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
     try:
         with connection as vasp_task:
             result = vasp_task.extract_file(file_path=file_path)
@@ -2113,10 +2136,14 @@ async def create_mission(task_directory: str, mission: str) -> dict:
         "band": "create_band_mission",
         "dos": "create_dos_mission"
     }
-    
+
     if mission not in method_map:
         return {"args": args, "returns": {"success": False, "error": f"未知的计算类型: {mission}，可选: {list(method_map.keys())}"}}
-    
+
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
+
     try:
         with connection as vasp_task:
             method_name = method_map[mission]
@@ -2160,10 +2187,14 @@ async def submit_mission(task_directory: str, mission: str) -> dict:
         "band": "submit_band_calculation",
         "dos": "submit_dos_calculation"
     }
-    
+
     if mission not in method_map:
         return {"args": args, "returns": {"success": False, "error": f"未知的计算类型: {mission}，可选: {list(method_map.keys())}"}}
-    
+
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
+
     try:
         with connection as vasp_task:
             method_name = method_map[mission]
@@ -2221,7 +2252,11 @@ async def modify_incar(task_directory: str, mission: str, read: bool, write: str
                 return {"args": args, "returns": {"success": False, "error": "write参数必须是JSON对象（字典）"}}
         except Exception as e:
             return {"args": args, "returns": {"success": False, "error": f"解析write参数失败: {str(e)}"}}
-    
+
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
+
     try:
         with connection as vasp_task:
             result = vasp_task.modify_incar_file(
@@ -2281,6 +2316,10 @@ def extract_result(task_directory: str, mission: str, plot: bool = True, smooth:
 
     if mission not in method_map:
         return {"args": args, "returns": {"success": False, "error": f"未知的计算类型: {mission}，可选: ['relax', 'scf', 'band', 'dos']", "task_directory": task_directory, "mission": mission}}
+
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
 
     try:
         result = method_map[mission]()
@@ -2371,7 +2410,11 @@ async def predict_with_alignn(
     args = {"cif_path": cif_path, "keep_temp_files": keep_temp_files}
     if properties is not None:
         args["properties"] = properties
-    
+
+    conn_err = _check_connection()
+    if conn_err:
+        return {"args": args, "returns": conn_err}
+
     try:
         with connection as vasp_task:
             result = vasp_task.predict_from_local_cif(
@@ -2635,19 +2678,25 @@ if __name__ == "__main__":
     try:
         # 启动文件服务器
         matfileserver = flask_server.MatFileServer()
-        # 连接远程服务器
-        connection = tryssh.VaspTaskInitializer(HOST, USERNAME, PASSWORD, PORT)
-        for i in range(5):
-            try:
-                with connection as vasp_task:
-                    if vasp_task.link():
-                        print("已成功连接到远程服务器")
-                        break
-            except Exception as e:
-                print(f"连接远程服务器失败，正在重试... ({i+1}/5), 错误: {e}")
-                if i == 4:
-                    raise e
-        
+        # 连接远程服务器（失败不影响其他工具）
+        connection = None
+        try:
+            connection = tryssh.VaspTaskInitializer(HOST, USERNAME, PASSWORD, PORT)
+            for i in range(5):
+                try:
+                    with connection as vasp_task:
+                        if vasp_task.link():
+                            print("已成功连接到远程服务器")
+                            break
+                except Exception as e:
+                    print(f"连接远程服务器失败，正在重试... ({i+1}/5), 错误: {e}")
+                    if i == 4:
+                        print("⚠️ 无法连接到计算服务器，VASP/计算相关工具将不可用，其他工具正常服务")
+                        connection = None
+        except Exception as e:
+            print(f"⚠️ 计算服务器初始化失败: {e}，VASP/计算相关工具将不可用，其他工具正常服务")
+            connection = None
+
         # 启动 MCP 服务器
         mcp.run(
             transport="sse",
