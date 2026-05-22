@@ -1255,14 +1255,34 @@ def chat_page():
                     tool_running_count = max(0, tool_running_count - 1)
                     
                 elif event_type == "complete" and isinstance(data, dict):
-                    # 流结束，使用后端返回的完整消息（已清理工具JSON）
-                    full_message = data.get("message", full_message)
+                    # 流结束，使用后端返回的完整消息（权威来源，覆盖增量拼接的文本）
+                    authoritative_message = data.get("message", "")
+                    if authoritative_message:
+                        full_message = authoritative_message
+                        # 渲染到当前 placeholder 并清空 current_text，避免 post-loop 重复保存
+                        current_text_placeholder.markdown(authoritative_message)
+                        content_placeholders.append({
+                            "type": "text",
+                            "placeholder": current_text_placeholder,
+                            "content": authoritative_message
+                        })
+                        current_text = ""
                     duration = data.get("duration", 0)
                     # 用后端提供的权威 tool_results 更新所有未完成的工具框
                     _reconcile_tools(data.get("tool_results", []), content_placeholders)
 
                 elif event_type == "done" and isinstance(data, dict):
                     # 兼容旧格式的流结束事件
+                    authoritative_message = data.get("message", "")
+                    if authoritative_message:
+                        full_message = authoritative_message
+                        current_text_placeholder.markdown(authoritative_message)
+                        content_placeholders.append({
+                            "type": "text",
+                            "placeholder": current_text_placeholder,
+                            "content": authoritative_message
+                        })
+                        current_text = ""
                     duration = data.get("duration", 0)
                     _reconcile_tools(data.get("tool_results", []), content_placeholders)
                     
